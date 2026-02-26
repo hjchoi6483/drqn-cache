@@ -30,5 +30,9 @@ def build_trace(
             phases=int(config["HOTSHIFT_PHASES"]),
             offset_step_mode=str(config["HOTSHIFT_OFFSET_STEP_MODE"]),
             offset_step_custom=int(config["HOTSHIFT_OFFSET_STEP_CUSTOM"]),
+            phase_skew=str(config["HOTSHIFT_PHASE_SKEW"]),
+            mix_ratio=float(config["HOTSHIFT_MIX_RATIO"]),
+            transition=str(config["HOTSHIFT_TRANSITION"]),
+            random_seed=seed,
         )
     raise ValueError(scenario)

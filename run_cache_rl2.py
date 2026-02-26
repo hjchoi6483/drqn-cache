@@ -34,6 +34,7 @@ import numpy as np
 from src.baselines.factory import build_baselines
 from src.evaluation.evaluator import evaluate_policy_with_baselines, BaselineKey
 from src.workload.builder import build_trace
+from src.workload.diagnostics import workload_diagnostics
 
 # ---- Dependency check ----
 try:
@@ -98,9 +99,12 @@ CONFIG = {
     "BASELINES": ["lru"],
 
     # --- hotshift 강화 ---
-    "HOTSHIFT_PHASES": 4,
-    "HOTSHIFT_OFFSET_STEP_MODE": "half_plus_one",  # vocab//2 + 1
-    "HOTSHIFT_OFFSET_STEP_CUSTOM": 5001,           # mode="custom"일 때만 사용
+    "HOTSHIFT_PHASES": 12,
+    "HOTSHIFT_OFFSET_STEP_MODE": "coprime_stride",
+    "HOTSHIFT_OFFSET_STEP_CUSTOM": 5003,
+    "HOTSHIFT_PHASE_SKEW": "1.25,1.35,1.45,1.55,1.65,1.75",
+    "HOTSHIFT_MIX_RATIO": 0.8,
+    "HOTSHIFT_TRANSITION": "smooth",
 
     # training
     "EPISODE_LEN": 4000,
@@ -244,6 +248,9 @@ def results_csv_path() -> str:
 
 def summary_csv_path() -> str:
     return os.path.join(CONFIG["OUT_DIR"], "summary.csv")
+
+def diagnostics_csv_path() -> str:
+    return os.path.join(CONFIG["OUT_DIR"], "workload_diagnostics.csv")
 
 def write_row_csv(path: str, row: dict):
     exists = os.path.exists(path)
@@ -1039,6 +1046,28 @@ def run_all():
         if gk not in stream_cache:
             print(f"\n[TRACE] building trace for scenario={scenario}, alpha={alpha}, seed={seed} ...", flush=True)
             req_stream = build_trace(CONFIG, scenario, alpha, seed, set_seed)
+            phases = int(CONFIG["HOTSHIFT_PHASES"]) if scenario == "hotshift" else 1
+            diag = workload_diagnostics(
+                trace=req_stream,
+                vocab_size=int(CONFIG["VOCAB_SIZE"]),
+                phases=phases,
+                top_k=min(100, int(CONFIG["VOCAB_SIZE"])),
+            )
+            diag_row = {
+                "scenario": scenario,
+                "alpha": float(alpha),
+                "seed": int(seed),
+                **diag,
+            }
+            write_row_csv(diagnostics_csv_path(), diag_row)
+            print(
+                "[DIAG]"
+                f" scenario={scenario} alpha={alpha} seed={seed}"
+                f" js_mean={diag['diag_js_mean']:.4f}"
+                f" topk_overlap={diag['diag_topk_overlap_mean']:.4f}",
+                flush=True,
+            )
+
             split = int(len(req_stream) * float(CONFIG["TRAIN_RATIO"]))
             stream_cache[gk] = {
                 "train": req_stream[:split],
@@ -1065,6 +1094,7 @@ def run_all():
 
     print("\nSaved:", results_csv_path())
     print("Saved:", summary_csv_path())
+    print("Saved:", diagnostics_csv_path())
     print("Logs:", os.path.join(CONFIG["OUT_DIR"], "logs"))
     print("Ckpts:", os.path.join(CONFIG["OUT_DIR"], "ckpt"))
 
