@@ -1,0 +1,86 @@
+from __future__ import annotations
+
+from typing import Callable, Dict, List, Tuple
+
+
+BaselineKey = Tuple[str, float, int, str, Tuple[str, ...]]
+
+
+def compute_baselines_once(
+    scenario: str,
+    alpha: float,
+    cache_size: int,
+    eval_kind: str,
+    test_stream: List[int],
+    baseline_names: List[str],
+    baseline_cache: Dict[BaselineKey, Dict[str, float]],
+    build_baselines_fn: Callable[[List[str], int], Dict[str, object]],
+) -> Dict[str, float]:
+    names_key = tuple(sorted(baseline_names))
+    key: BaselineKey = (scenario, float(alpha), int(cache_size), str(eval_kind), names_key)
+    if key in baseline_cache:
+        return baseline_cache[key]
+
+    baselines = build_baselines_fn(baseline_names, cache_size)
+    for req in test_stream:
+        for baseline in baselines.values():
+            baseline.access(req)
+
+    out = {
+        f"baseline_hit_{name}": float(baseline.stats()["hit_rate"])
+        for name, baseline in baselines.items()
+    }
+    baseline_cache[key] = out
+    return out
+
+
+def evaluate_policy_with_baselines(
+    model,
+    scenario: str,
+    alpha: float,
+    test_stream: List[int],
+    cache_size: int,
+    s,
+    eval_kind: str,
+    baseline_names: List[str],
+    baseline_cache: Dict[BaselineKey, Dict[str, float]],
+    build_baselines_fn: Callable[[List[str], int], Dict[str, object]],
+    make_env_fn,
+    make_obs_fn,
+    select_action_fn,
+):
+    model.eval()
+    env = make_env_fn(cache_size, s)
+    hidden = model.init_hidden(1)
+
+    rl_hits = 0
+    rl_miss = 0
+    for req in test_stream:
+        obs = make_obs_fn(env, req)
+        a, hidden = select_action_fn(model, obs, hidden, eps=0.0)
+        _r, hit = env.step(req, a)
+        if hit:
+            rl_hits += 1
+        else:
+            rl_miss += 1
+
+    total = rl_hits + rl_miss
+    rl_hit = (rl_hits / total) * 100.0 if total else 0.0
+
+    baseline_res = compute_baselines_once(
+        scenario=scenario,
+        alpha=alpha,
+        cache_size=cache_size,
+        eval_kind=eval_kind,
+        test_stream=test_stream,
+        baseline_names=baseline_names,
+        baseline_cache=baseline_cache,
+        build_baselines_fn=build_baselines_fn,
+    )
+
+    out = {"rl_hit": float(rl_hit)}
+    out.update(baseline_res)
+    for name in baseline_names:
+        hit = baseline_res.get(f"baseline_hit_{name}", 0.0)
+        out[f"rl_minus_baseline_{name}"] = float(rl_hit - hit)
+    return out

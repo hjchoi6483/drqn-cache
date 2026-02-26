@@ -28,9 +28,12 @@ import random
 import argparse
 from dataclasses import dataclass, asdict
 from typing import List, Tuple, Dict
-from collections import deque, OrderedDict
+from collections import deque
 
 import numpy as np
+from src.baselines.factory import build_baselines
+from src.evaluation.evaluator import evaluate_policy_with_baselines, BaselineKey
+from src.workload.builder import build_trace
 
 # ---- Dependency check ----
 try:
@@ -90,6 +93,9 @@ CONFIG = {
     # cache sizes / scenarios
     "CACHE_SIZES": [16, 64],
     "SCENARIOS": ["zipf", "hotshift"],
+
+    # baseline list (Step A multi-baseline-ready schema)
+    "BASELINES": ["lru"],
 
     # --- hotshift 강화 ---
     "HOTSHIFT_PHASES": 4,
@@ -260,76 +266,8 @@ def load_done_ids() -> set:
 
 
 # =========================
-# 4) Workload generators
+# 4) Workload generators (modularized in src/workload)
 # =========================
-def trace_zipf(num_requests: int, vocab_size: int, alpha: float) -> List[int]:
-    samples = np.random.zipf(a=alpha, size=num_requests)
-    ids = (samples % vocab_size) + 1
-    return ids.astype(np.int64).tolist()
-
-def _hotshift_offset_step(vocab_size: int) -> int:
-    mode = CONFIG["HOTSHIFT_OFFSET_STEP_MODE"]
-    if mode == "half_plus_one":
-        return (vocab_size // 2) + 1
-    if mode == "custom":
-        step = int(CONFIG["HOTSHIFT_OFFSET_STEP_CUSTOM"])
-        if step <= 0:
-            raise ValueError("HOTSHIFT_OFFSET_STEP_CUSTOM must be positive.")
-        return step
-    raise ValueError(mode)
-
-def trace_hotshift(num_requests: int, vocab_size: int, alpha: float, phases: int) -> List[int]:
-    ranks = np.random.zipf(a=alpha, size=num_requests)
-    ranks0 = ((ranks - 1) % vocab_size).astype(np.int64)
-
-    phase_len = max(1, num_requests // phases)
-    step = _hotshift_offset_step(vocab_size)
-
-    out = np.empty((num_requests,), dtype=np.int64)
-    for i in range(num_requests):
-        p = min(i // phase_len, phases - 1)
-        offset = (p * step) % vocab_size
-        out[i] = ((ranks0[i] + offset) % vocab_size) + 1
-
-    return out.tolist()
-
-def build_trace(scenario: str, alpha: float, seed: int) -> List[int]:
-    set_seed(seed)
-    nreq = int(CONFIG["NUM_REQUESTS"])
-    vocab = int(CONFIG["VOCAB_SIZE"])
-
-    if scenario == "zipf":
-        return trace_zipf(nreq, vocab, alpha)
-    if scenario == "hotshift":
-        return trace_hotshift(nreq, vocab, alpha, int(CONFIG["HOTSHIFT_PHASES"]))
-    raise ValueError(scenario)
-
-
-# =========================
-# 5) Baselines (LRU only)
-# =========================
-class LRUCacheSim:
-    def __init__(self, capacity: int):
-        self.capacity = capacity
-        self.cache = OrderedDict()
-        self.hits = 0
-        self.misses = 0
-
-    def access(self, key: int) -> bool:
-        if key in self.cache:
-            self.cache.move_to_end(key)
-            self.hits += 1
-            return True
-        self.misses += 1
-        self.cache[key] = True
-        if len(self.cache) > self.capacity:
-            self.cache.popitem(last=False)
-        return False
-
-    def hit_rate(self) -> float:
-        t = self.hits + self.misses
-        return (self.hits / t) * 100.0 if t else 0.0
-
 
 # =========================
 # 6) Environment
@@ -728,7 +666,7 @@ def train_step(online, target, optimizer, replay: EpisodeReplay, cache_size: int
 
 
 # =========================
-# 10) Rollout + Eval (LRU baseline caching)
+# 10) Rollout + Eval (modular baselines)
 # =========================
 def rollout_episode(model, req_stream: List[int], start: int, length: int,
                     cache_size: int, s: Setting, eps: float) -> Tuple[List[Obs], List[AR], float]:
@@ -765,27 +703,20 @@ def rollout_episode(model, req_stream: List[int], start: int, length: int,
     ))
     return obs_list, ar_list, total_rew
 
-BaselineKey = Tuple[str, float, int, str]  # (scenario, alpha, cache_size, "fast"|"full")
 BASELINE_CACHE: Dict[BaselineKey, Dict[str, float]] = {}
 
-def compute_lru_baseline_once(
-    scenario: str,
-    alpha: float,
-    cache_size: int,
-    eval_kind: str,
-    test_stream: List[int],
-) -> Dict[str, float]:
-    key: BaselineKey = (scenario, float(alpha), int(cache_size), str(eval_kind))
-    if key in BASELINE_CACHE:
-        return BASELINE_CACHE[key]
 
-    lru = LRUCacheSim(cache_size)
-    for req in test_stream:
-        lru.access(req)
-    out = {"lru_hit": float(lru.hit_rate())}
+def make_env_for_eval(cache_size: int, s: Setting) -> CacheEnv:
+    return CacheEnv(cache_size, use_global=s.use_global, invalid_penalty=s.invalid_penalty)
 
-    BASELINE_CACHE[key] = out
-    return out
+
+def make_obs_for_eval(env: CacheEnv, req: int) -> Obs:
+    return Obs(
+        cache_feat=env.get_cache_features(),
+        global_feat=env.get_global_features(),
+        valid_mask=env.valid_action_mask(req),
+    )
+
 
 def eval_policy(
     model,
@@ -796,29 +727,22 @@ def eval_policy(
     s: Setting,
     eval_kind: str,
 ) -> Dict[str, float]:
-    model.eval()
-    env = CacheEnv(cache_size, use_global=s.use_global, invalid_penalty=s.invalid_penalty)
-    hidden = model.init_hidden(1)
-
-    rl_hits = 0
-    rl_miss = 0
-    with torch.no_grad():
-        for req in test_stream:
-            obs = Obs(
-                cache_feat=env.get_cache_features(),
-                global_feat=env.get_global_features(),
-                valid_mask=env.valid_action_mask(req),
-            )
-            a, hidden = select_action(model, obs, hidden, eps=0.0)
-            _r, hit = env.step(req, a)
-            if hit:
-                rl_hits += 1
-            else:
-                rl_miss += 1
-
-    rl = (rl_hits / (rl_hits + rl_miss)) * 100.0 if (rl_hits + rl_miss) else 0.0
-    base = compute_lru_baseline_once(scenario, alpha, cache_size, eval_kind, test_stream)
-    return {"rl_hit": float(rl), "lru_hit": float(base["lru_hit"])}
+    baseline_names = list(CONFIG["BASELINES"])
+    return evaluate_policy_with_baselines(
+        model=model,
+        scenario=scenario,
+        alpha=alpha,
+        test_stream=test_stream,
+        cache_size=cache_size,
+        s=s,
+        eval_kind=eval_kind,
+        baseline_names=baseline_names,
+        baseline_cache=BASELINE_CACHE,
+        build_baselines_fn=build_baselines,
+        make_env_fn=make_env_for_eval,
+        make_obs_fn=make_obs_for_eval,
+        select_action_fn=select_action,
+    )
 
 
 # =========================
@@ -1004,15 +928,19 @@ def train_one_run(
         "final_loss_tail_mean": float(np.mean(st.loss_tail[-1000:])) if st.loss_tail else 0.0,
 
         "rl_hit": float(final["rl_hit"]),
-        "lru_hit": float(final["lru_hit"]),
         "wall_sec": float(time.time() - t0),
     }
+
+    for name in CONFIG["BASELINES"]:
+        row[f"baseline_hit_{name}"] = float(final.get(f"baseline_hit_{name}", 0.0))
+        row[f"rl_minus_baseline_{name}"] = float(final.get(f"rl_minus_baseline_{name}", 0.0))
     write_row_csv(results_csv_path(), row)
 
     if CONFIG["SAVE_CKPT"]:
         save_ckpt(rid, online, target, optimizer, replay, st)
 
-    print(f"\n[DONE] {rid} | RL {row['rl_hit']:.2f}  LRU {row['lru_hit']:.2f}", flush=True)
+    baseline_msg = ' '.join([f"{str(name).upper()} {row.get('baseline_hit_' + str(name), 0.0):.2f}" for name in CONFIG['BASELINES']])
+    print(f"\n[DONE] {rid} | RL {row['rl_hit']:.2f}  {baseline_msg}", flush=True)
 
 
 # =========================
@@ -1044,19 +972,31 @@ def build_summary():
         key=lambda x: (x[0][0], float(x[0][1]), int(x[0][2]), x[0][3])
     ):
         rl = [float(x["rl_hit"]) for x in rs]
-        lru = [float(x["lru_hit"]) for x in rs]
         rl_m, rl_s = mean_std(rl)
-        lru_m, lru_s = mean_std(lru)
 
-        out.append({
+        row_out = {
             "scenario": scenario,
             "alpha": float(alpha),
             "cache_size": int(cache_size),
             "setting": setting,
             "n": len(rs),
-            "rl_mean": rl_m, "rl_std": rl_s,
-            "lru_mean": lru_m, "lru_std": lru_s,
-        })
+            "rl_mean": rl_m,
+            "rl_std": rl_s,
+        }
+
+        for baseline_name in CONFIG["BASELINES"]:
+            baseline_col = f"baseline_hit_{baseline_name}"
+            delta_col = f"rl_minus_baseline_{baseline_name}"
+            baseline_vals = [float(x.get(baseline_col, 0.0)) for x in rs]
+            delta_vals = [float(x.get(delta_col, 0.0)) for x in rs]
+            b_m, b_s = mean_std(baseline_vals)
+            d_m, d_s = mean_std(delta_vals)
+            row_out[f"{baseline_name}_mean"] = b_m
+            row_out[f"{baseline_name}_std"] = b_s
+            row_out[f"rl_minus_{baseline_name}_mean"] = d_m
+            row_out[f"rl_minus_{baseline_name}_std"] = d_s
+
+        out.append(row_out)
 
     if out:
         with open(summary_csv_path(), "w", newline="", encoding="utf-8") as f:
@@ -1098,7 +1038,7 @@ def run_all():
         gk = (scenario, float(alpha), int(seed))
         if gk not in stream_cache:
             print(f"\n[TRACE] building trace for scenario={scenario}, alpha={alpha}, seed={seed} ...", flush=True)
-            req_stream = build_trace(scenario, alpha, seed)
+            req_stream = build_trace(CONFIG, scenario, alpha, seed, set_seed)
             split = int(len(req_stream) * float(CONFIG["TRAIN_RATIO"]))
             stream_cache[gk] = {
                 "train": req_stream[:split],
