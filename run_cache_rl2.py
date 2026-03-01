@@ -88,6 +88,7 @@ print("DEVICE:", DEVICE)
 # =========================
 CONFIG = {
     "OUT_DIR": OUT_DIR,
+    "EXPERIMENT_TAG": "full",
 
     # workload
     "VOCAB_SIZE": 10_000,
@@ -153,6 +154,7 @@ CONFIG = {
 def apply_quick_preset():
     # 목적: “대략 돌아가는지 / 트렌드 확인”용
     CONFIG.update({
+        "EXPERIMENT_TAG": "quick",
         "NUM_REQUESTS": 250_000,
 
         # alpha는 요청대로 1.3~1.8 유지
@@ -210,7 +212,8 @@ SETTINGS: List[Setting] = [
 # 3) I/O helpers
 # =========================
 def run_id(scenario: str, alpha: float, cache_size: int, seed: int, s: Setting) -> str:
-    return f"{scenario}_a{alpha}_S{cache_size}_seed{seed}_{setting_name(s)}"
+    tag = str(CONFIG.get("EXPERIMENT_TAG", "default"))
+    return f"{tag}_{scenario}_a{alpha}_S{cache_size}_seed{seed}_{setting_name(s)}"
 
 def safe_filename(s: str) -> str:
     bad = '<>:"/\\|?*'
