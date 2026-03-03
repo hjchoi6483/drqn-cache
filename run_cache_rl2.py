@@ -412,6 +412,7 @@ def train_one_run(
     t0 = time.time()
     pbar = tqdm(range(st.ep_done + 1, max_eps + 1), desc=f"TRAIN {rid}", leave=True)
 
+    interrupted = False
     try:
         for ep in pbar:
             if st.train_cursor + ep_len >= len(train_ids):
@@ -501,6 +502,9 @@ def train_one_run(
 
     finally:
         flog.close()
+
+    if interrupted:
+        return None
 
     # final eval: full
     final = eval_policy(online, scenario, alpha, test_full, cache_size, s, eval_kind="full")
