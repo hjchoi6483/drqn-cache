@@ -491,7 +491,6 @@ def train_one_run(
                 save_ckpt(rid, online, target, optimizer, replay, st)
 
     except KeyboardInterrupt:
-        interrupted = True
         if CONFIG["SAVE_CKPT"]:
             save_ckpt(rid, online, target, optimizer, replay, st)
         print(
@@ -499,7 +498,7 @@ def train_one_run(
             f"step={st.global_step}, cursor={st.train_cursor}",
             flush=True,
         )
-
+        raise SystemExit(130)
 
     finally:
         flog.close()
