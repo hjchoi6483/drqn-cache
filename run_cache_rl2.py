@@ -489,6 +489,16 @@ def train_one_run(
             if CONFIG["SAVE_CKPT"] and (ep % int(CONFIG["SAVE_CKPT_EVERY_EP"]) == 0):
                 save_ckpt(rid, online, target, optimizer, replay, st)
 
+    except KeyboardInterrupt:
+        if CONFIG["SAVE_CKPT"]:
+            save_ckpt(rid, online, target, optimizer, replay, st)
+        print(
+            f"\n[INTERRUPTED] {rid} | checkpoint saved at ep={st.ep_done}, "
+            f"step={st.global_step}, cursor={st.train_cursor}",
+            flush=True,
+        )
+        raise
+
     finally:
         flog.close()
 
@@ -578,7 +588,13 @@ def objective(trial: optuna.trial.Trial, stream_cache: Dict[Tuple[str, float, in
 
 def optimize_hparams(stream_cache: Dict[Tuple[str, float, int], Dict[str, List[int]]]) -> Dict[str, float]:
     print("\n[OPTUNA] Starting hyperparameter optimization...")
-    study = optuna.create_study(direction="maximize", pruner=optuna.pruners.MedianPruner())
+    study = optuna.create_study(
+        direction="maximize",
+        pruner=optuna.pruners.MedianPruner(),
+        storage="sqlite:///optuna_study.db",
+        study_name="drqn_cache_tuning",
+        load_if_exists=True,
+    )
     study.optimize(lambda trial: objective(trial, stream_cache), n_trials=int(ARGS.optuna_trials))
     best_params = dict(study.best_params)
     with open(os.path.join(CONFIG["OUT_DIR"], "best_params.json"), "w", encoding="utf-8") as f:

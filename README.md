@@ -39,7 +39,7 @@ DRQN 기반 캐시 교체 실험 러너입니다. 현재 코드는 **2단계 워
 
 `run_all()` 시작 시 1회 수행:
 
-- `study = optuna.create_study(direction="maximize", pruner=MedianPruner)`
+- `study = optuna.create_study(direction="maximize", pruner=MedianPruner, storage="sqlite:///optuna_study.db", study_name="drqn_cache_tuning", load_if_exists=True)`
 - `n_trials` 기본값 40 (`--optuna_trials`로 조정)
 - objective 내부 대표 시나리오 고정:
   - `scenario='zipf'`
@@ -99,6 +99,16 @@ python run_cache_rl2.py --out_dir out_full --device cpu --optuna_trials 40
 - `OUT_DIR/summary.csv`: 그룹 집계 결과
 - `OUT_DIR/logs/*.jsonl`: 학습 로그
 - `OUT_DIR/ckpt/*.pt`: 체크포인트
+
+---
+
+
+## 실험 중단/재시작 가이드 (Windows CMD 포함)
+
+- **중단 방법 (Graceful Exit):** 실행 중인 CMD 창에서 `Ctrl+C`를 누르면 현재 학습 상태를 체크포인트(`OUT_DIR/ckpt/*.pt`)로 즉시 저장한 뒤, 프로세스 전체가 종료됩니다(다음 trial/실험으로 자동 진행하지 않음).
+- **재개 방법:** 같은 명령어를 다시 실행하면 기존 체크포인트(`ep_done`, `global_step`, `train_cursor`, `replay`, optimizer/model 상태)를 자동 복구하여 이어서 학습합니다.
+- **Optuna 재개:** Optuna 탐색 이력은 로컬 `optuna_study.db`(SQLite)에 저장되며, 동일 study 이름으로 자동 이어서 실행됩니다.
+- **초기화 방법:** 완전히 새 실험을 시작하려면 `out/` 폴더(또는 지정한 `OUT_DIR`)와 `optuna_study.db` 파일을 삭제한 뒤 다시 실행하세요.
 
 ---
 
