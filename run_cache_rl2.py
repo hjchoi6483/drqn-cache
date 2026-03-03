@@ -30,6 +30,7 @@ from dataclasses import dataclass, asdict
 from typing import List, Tuple, Dict
 
 import numpy as np
+import optuna
 from src.baselines.factory import build_baselines
 from src.evaluation.evaluator import evaluate_policy_with_baselines, BaselineKey
 from src.models.drqn import (
@@ -62,6 +63,14 @@ except Exception as e:
         f"원인: {repr(e)}"
     )
 
+try:
+    from optuna.exceptions import TrialPruned
+except Exception as e:
+    raise RuntimeError(
+        "Optuna가 필요함. 예) pip install optuna\n"
+        f"원인: {repr(e)}"
+    )
+
 
 # =========================
 # 0) CLI
@@ -71,6 +80,7 @@ def parse_args():
     p.add_argument("--out_dir", type=str, default="out", help="결과 저장 폴더 (기본: ./out)")
     p.add_argument("--device", type=str, default=None, help="cpu | cuda | cuda:0 등")
     p.add_argument("--use_quick_preset", action="store_true", help="빠른 실험용 축소 프리셋 적용")
+    p.add_argument("--optuna_trials", type=int, default=40, help="Optuna trial 횟수 (기본: 40)")
     return p.parse_args()
 
 ARGS = parse_args()
@@ -354,13 +364,19 @@ def train_one_run(
     train_ids: List[int],
     test_fast: List[int],
     test_full: List[int],
+    trial: optuna.trial.Trial | None = None,
+    persist_result: bool = True,
+    run_suffix: str | None = None,
 ):
     ensure_dirs()
     rid = run_id(scenario, alpha, cache_size, seed, s)
+    if run_suffix:
+        rid = f"{rid}_{run_suffix}"
 
-    done = load_done_ids()
-    if rid in done:
-        return
+    if persist_result:
+        done = load_done_ids()
+        if rid in done:
+            return None
 
     set_seed(seed)
 
@@ -433,6 +449,10 @@ def train_one_run(
             if ep % int(CONFIG["FAST_EVAL_EVERY_EP"]) == 0:
                 res = eval_policy(online, scenario, alpha, test_fast, cache_size, s, eval_kind="fast")
                 eval_rec.update({f"fast_{k}": v for k, v in res.items()})
+                if trial is not None:
+                    trial.report(hit_proxy, ep)
+                    if trial.should_prune():
+                        raise TrialPruned(f"Pruned at ep={ep}, hit_proxy={hit_proxy:.4f}")
 
             if ep % int(CONFIG["FULL_EVAL_EVERY_EP"]) == 0:
                 res = eval_policy(online, scenario, alpha, test_full, cache_size, s, eval_kind="full")
@@ -497,13 +517,74 @@ def train_one_run(
     for name in CONFIG["BASELINES"]:
         row[f"baseline_hit_{name}"] = float(final.get(f"baseline_hit_{name}", 0.0))
         row[f"rl_minus_baseline_{name}"] = float(final.get(f"rl_minus_baseline_{name}", 0.0))
-    write_row_csv(results_csv_path(), row)
+    if persist_result:
+        write_row_csv(results_csv_path(), row)
 
     if CONFIG["SAVE_CKPT"]:
         save_ckpt(rid, online, target, optimizer, replay, st)
 
     baseline_msg = ' '.join([f"{str(name).upper()} {row.get('baseline_hit_' + str(name), 0.0):.2f}" for name in CONFIG['BASELINES']])
     print(f"\n[DONE] {rid} | RL {row['rl_hit']:.2f}  {baseline_msg}", flush=True)
+    return row
+
+
+def build_stream_cache() -> Dict[Tuple[str, float, int], Dict[str, List[int]]]:
+    stream_cache: Dict[Tuple[str, float, int], Dict[str, List[int]]] = {}
+    for scenario in CONFIG["SCENARIOS"]:
+        for alpha in CONFIG["ZIPF_ALPHAS"]:
+            for seed in CONFIG["SEEDS"]:
+                gk = (scenario, float(alpha), int(seed))
+                req_stream = build_trace(CONFIG, scenario, alpha, seed, set_seed)
+                split = int(len(req_stream) * float(CONFIG["TRAIN_RATIO"]))
+                stream_cache[gk] = {
+                    "train": req_stream[:split],
+                    "fast": req_stream[split: split + int(CONFIG["FAST_EVAL_STEPS"])],
+                    "full": req_stream[split: split + int(CONFIG["FULL_EVAL_STEPS"])],
+                }
+    return stream_cache
+
+
+def objective(trial: optuna.trial.Trial, stream_cache: Dict[Tuple[str, float, int], Dict[str, List[int]]]) -> float:
+    CONFIG["LR"] = trial.suggest_float("LR", 1e-5, 1e-3, log=True)
+    CONFIG["GAMMA"] = trial.suggest_float("GAMMA", 0.9, 0.999)
+    CONFIG["UNROLL"] = trial.suggest_int("UNROLL", 20, 80, step=10)
+    CONFIG["BATCH_SIZE"] = trial.suggest_categorical("BATCH_SIZE", [16, 32, 64])
+
+    scenario = "zipf"
+    alpha = 1.3
+    cache_size = 16
+    seed = int(CONFIG["SEEDS"][0])
+    s = SETTINGS[0]
+
+    gk = (scenario, float(alpha), seed)
+    streams = stream_cache[gk]
+    row = train_one_run(
+        scenario=scenario,
+        alpha=alpha,
+        cache_size=cache_size,
+        seed=seed,
+        s=s,
+        train_ids=streams["train"],
+        test_fast=streams["fast"],
+        test_full=streams["full"],
+        trial=trial,
+        persist_result=False,
+        run_suffix=f"optuna_t{trial.number}",
+    )
+    if row is None:
+        return 0.0
+    return float(row["rl_hit"])
+
+
+def optimize_hparams(stream_cache: Dict[Tuple[str, float, int], Dict[str, List[int]]]) -> Dict[str, float]:
+    print("\n[OPTUNA] Starting hyperparameter optimization...")
+    study = optuna.create_study(direction="maximize", pruner=optuna.pruners.MedianPruner())
+    study.optimize(lambda trial: objective(trial, stream_cache), n_trials=int(ARGS.optuna_trials))
+    best_params = dict(study.best_params)
+    with open(os.path.join(CONFIG["OUT_DIR"], "best_params.json"), "w", encoding="utf-8") as f:
+        json.dump(best_params, f, ensure_ascii=False, indent=2)
+    print(f"[OPTUNA] Best params: {best_params}")
+    return best_params
 
 
 # =========================
@@ -574,6 +655,16 @@ def build_summary():
 # =========================
 def run_all():
     ensure_dirs()
+
+    # Step 0: stream cache 생성(재사용)
+    stream_cache = build_stream_cache()
+
+    # Step 1: Optuna 최적화(딱 1회)
+    best_params = optimize_hparams(stream_cache)
+    CONFIG.update(best_params)
+    print(f"[OPTUNA] Applied best params to CONFIG: {best_params}")
+
+    # Step 2: 기존 실험 매트릭스 실행
     done = load_done_ids()
 
     tasks = []
@@ -589,9 +680,6 @@ def run_all():
 
     print(f"Remaining runs: {len(tasks)}")
 
-    # trace cache: per (scenario,alpha,seed) 공유
-    stream_cache: Dict[Tuple[str, float, int], Dict[str, List[int]]] = {}
-
     master = tqdm(tasks, desc="ALL RUNS", leave=True)
     for scenario, alpha, cache_size, seed, s in master:
         master.set_postfix({
@@ -599,16 +687,6 @@ def run_all():
         })
 
         gk = (scenario, float(alpha), int(seed))
-        if gk not in stream_cache:
-            print(f"\n[TRACE] building trace for scenario={scenario}, alpha={alpha}, seed={seed} ...", flush=True)
-            req_stream = build_trace(CONFIG, scenario, alpha, seed, set_seed)
-            split = int(len(req_stream) * float(CONFIG["TRAIN_RATIO"]))
-            stream_cache[gk] = {
-                "train": req_stream[:split],
-                "fast": req_stream[split: split + int(CONFIG["FAST_EVAL_STEPS"])],
-                "full": req_stream[split: split + int(CONFIG["FULL_EVAL_STEPS"])],
-            }
-
         train_ids = stream_cache[gk]["train"]
         test_fast = stream_cache[gk]["fast"]
         test_full = stream_cache[gk]["full"]
