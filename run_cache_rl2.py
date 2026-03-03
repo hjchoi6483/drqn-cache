@@ -412,6 +412,7 @@ def train_one_run(
     t0 = time.time()
     pbar = tqdm(range(st.ep_done + 1, max_eps + 1), desc=f"TRAIN {rid}", leave=True)
 
+    interrupted = False
     try:
         for ep in pbar:
             if st.train_cursor + ep_len >= len(train_ids):
@@ -490,6 +491,7 @@ def train_one_run(
                 save_ckpt(rid, online, target, optimizer, replay, st)
 
     except KeyboardInterrupt:
+        interrupted = True
         if CONFIG["SAVE_CKPT"]:
             save_ckpt(rid, online, target, optimizer, replay, st)
         print(
@@ -497,10 +499,13 @@ def train_one_run(
             f"step={st.global_step}, cursor={st.train_cursor}",
             flush=True,
         )
-        raise
+
 
     finally:
         flog.close()
+
+    if interrupted:
+        return None
 
     # final eval: full
     final = eval_policy(online, scenario, alpha, test_full, cache_size, s, eval_kind="full")
