@@ -78,7 +78,7 @@ except Exception as e:
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--out_dir", type=str, default="out", help="결과 저장 폴더 (기본: ./out)")
-    p.add_argument("--device", type=str, default=None, help="cpu | cuda | cuda:0 등")
+    p.add_argument("--device", type=str, default="cuda", help="cpu | cuda | cuda:0 등 (기본: cuda)")
     p.add_argument("--use_quick_preset", action="store_true", help="빠른 실험용 축소 프리셋 적용")
     p.add_argument("--optuna_trials", type=int, default=40, help="Optuna trial 횟수 (기본: 40)")
     return p.parse_args()
@@ -86,11 +86,40 @@ def parse_args():
 ARGS = parse_args()
 OUT_DIR = ARGS.out_dir
 
-if ARGS.device is not None:
-    DEVICE = torch.device(ARGS.device)
-else:
-    DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print("DEVICE:", DEVICE)
+def configure_torch_runtime(device_arg: str) -> torch.device:
+    requested = (device_arg or "cuda").lower().strip()
+    wants_cuda = requested.startswith("cuda")
+
+    if wants_cuda and not torch.cuda.is_available():
+        raise RuntimeError(
+            "CUDA 장치를 요청했지만 torch.cuda.is_available()가 False입니다. "
+            "CUDA 지원 PyTorch 설치/드라이버 점검 후 다시 실행하세요."
+        )
+
+    device = torch.device(requested)
+
+    if device.type == "cuda":
+        if device.index is not None and device.index >= torch.cuda.device_count():
+            raise RuntimeError(
+                f"요청한 CUDA 디바이스 인덱스({device.index})가 유효하지 않습니다. "
+                f"사용 가능한 GPU 개수: {torch.cuda.device_count()}"
+            )
+
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        if hasattr(torch, "set_float32_matmul_precision"):
+            torch.set_float32_matmul_precision("high")
+
+        dev_idx = device.index if device.index is not None else torch.cuda.current_device()
+        print(f"DEVICE: {device} ({torch.cuda.get_device_name(dev_idx)})")
+    else:
+        print(f"DEVICE: {device} (경고: GPU 가속 비활성화)")
+
+    return device
+
+
+DEVICE = configure_torch_runtime(ARGS.device)
 
 
 # =========================
