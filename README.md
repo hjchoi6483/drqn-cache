@@ -92,6 +92,100 @@ python run_cache_rl2.py --out_dir out_full --device cpu --optuna_trials 40
 
 ---
 
+
+## Colab Pro+에서 실행 (GitHub 코드 그대로, 기능 유지)
+
+아래 절차를 따르면 **GitHub에 올린 현재 코드 그대로** Colab Pro+ GPU에서 실행할 수 있습니다.
+(Optuna 2단계 워크플로우, 체크포인트 재개, 결과 집계 기능 유지)
+
+### 0) (선택) Colab에서 GitHub 노트북으로 바로 열기
+
+리포지토리에 notebook을 추가했다면 아래 형식으로 바로 열 수 있습니다.
+
+```text
+https://colab.research.google.com/github/<GITHUB_OWNER>/<REPO_NAME>/blob/<BRANCH>/notebooks/<NOTEBOOK>.ipynb
+```
+
+노트북이 없다면 아래 `git clone` 방식으로 실행하면 됩니다.
+
+### 1) Colab 런타임 설정
+
+- Colab 메뉴: `런타임` → `런타임 유형 변경`
+- Hardware accelerator: `GPU` (Pro+ 권장)
+
+### 2) Google Drive 마운트 (결과/체크포인트 영속화)
+
+```python
+from google.colab import drive
+drive.mount('/content/drive')
+```
+
+### 3) GitHub에서 코드 가져오기
+
+```bash
+%cd /content
+!git clone https://github.com/<GITHUB_OWNER>/<REPO_NAME>.git drqn-cache
+%cd /content/drqn-cache
+```
+
+- 브랜치를 지정하려면:
+
+```bash
+!git checkout <BRANCH_NAME>
+```
+
+### 4) 의존성 설치
+
+Colab 기본 PyTorch를 우선 사용하고, 프로젝트 필수 패키지만 설치합니다.
+
+```bash
+!pip install -U pip
+!pip install -r requirements-colab.txt
+```
+
+필요할 때만 PyTorch를 재설치하세요.
+
+```bash
+# 예시 (CUDA 12.1)
+# !pip install --index-url https://download.pytorch.org/whl/cu121 torch torchvision torchaudio
+```
+
+### 5) 실행 (Quick / Full)
+
+> 핵심: `--out_dir`를 Drive 경로로 두면, 런타임이 끊겨도 결과/체크포인트/Optuna DB를 유지할 수 있습니다.
+
+Quick (권장 시작):
+
+```bash
+!python run_cache_rl2.py \
+  --out_dir /content/drive/MyDrive/drqn-cache-out/quick \
+  --device cuda \
+  --use_quick_preset \
+  --optuna_trials 30
+```
+
+Full:
+
+```bash
+!python run_cache_rl2.py \
+  --out_dir /content/drive/MyDrive/drqn-cache-out/full \
+  --device cuda \
+  --optuna_trials 40
+```
+
+### 6) 재시작/이어달리기
+
+- 같은 `--out_dir`로 재실행하면 체크포인트(`ckpt/*.pt`)에서 자동 재개됩니다.
+- Optuna는 실행 경로의 `optuna_study.db`를 사용해 trial 기록을 이어갑니다.
+- 런타임 재할당이 잦다면 프로젝트 폴더 자체를 Drive에 clone해서 실행해도 됩니다.
+
+### 7) 자주 겪는 문제
+
+- `ModuleNotFoundError` 발생 시: `!pip install -r requirements-colab.txt` 재실행
+- GPU 미사용 시: 런타임 GPU 설정 후 `--device cuda`로 재실행
+- 새 실험으로 완전 초기화: 해당 `out_dir` + `optuna_study.db` 삭제 후 실행
+
+
 ## 출력 파일
 
 - `OUT_DIR/best_params.json`: Optuna 최적 하이퍼파라미터
