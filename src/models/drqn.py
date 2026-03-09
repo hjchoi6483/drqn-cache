@@ -222,46 +222,11 @@ class DRQN_PerSlot(nn.Module):
         return q, hidden
 
 
-class DQN_PerSlot(nn.Module):
-    def __init__(self, cache_size: int, use_global: bool):
-        super().__init__()
-        self.cache_size = cache_size
-        self.use_global = use_global
-
-        self.slot_proj = nn.Sequential(
-            nn.Linear(META_DIM, CACHE_KEY_DIM),
-            nn.ReLU(),
-            nn.Linear(CACHE_KEY_DIM, CACHE_KEY_DIM),
-            nn.ReLU(),
-        )
-
-        in_dim = 3 * CACHE_KEY_DIM + (GLOBAL_DIM if use_global else 0)
-        self.ctx_mlp = nn.Sequential(
-            nn.Linear(in_dim, HIDDEN_DIM),
-            nn.ReLU(),
-            nn.Linear(HIDDEN_DIM, HIDDEN_DIM),
-            nn.ReLU(),
-        )
-        self.head = PerSlotHead(cache_size, CACHE_KEY_DIM, HIDDEN_DIM)
-
-    def init_hidden(self, B: int):
-        return None
-
-    def forward_step(self, cache_feat: torch.Tensor, global_feat: torch.Tensor, _hidden=None):
-        slot_emb = self.slot_proj(cache_feat)
-        pooled = pool_meanmaxmin(slot_emb)
-        x = pooled if not self.use_global else torch.cat([pooled, global_feat], dim=1)
-        ctx = self.ctx_mlp(x)
-        q = self.head(slot_emb, ctx)
-        return q, None
-
-
 class PoolingQNet(nn.Module):
-    def __init__(self, cache_size: int, use_global: bool, use_lstm: bool, device: torch.device):
+    def __init__(self, cache_size: int, use_global: bool, device: torch.device):
         super().__init__()
         self.cache_size = cache_size
         self.use_global = use_global
-        self.use_lstm = use_lstm
         self.device = device
 
         self.slot_proj = nn.Sequential(
@@ -272,16 +237,11 @@ class PoolingQNet(nn.Module):
         )
         in_dim = 3 * CACHE_KEY_DIM + (GLOBAL_DIM if use_global else 0)
 
-        if use_lstm:
-            self.in_proj = nn.Sequential(nn.Linear(in_dim, LSTM_INPUT_DIM), nn.ReLU())
-            self.lstm = nn.LSTM(LSTM_INPUT_DIM, HIDDEN_DIM, batch_first=True)
-            self.out = nn.Sequential(nn.Linear(HIDDEN_DIM, 128), nn.ReLU(), nn.Linear(128, cache_size + 1))
-        else:
-            self.ff = nn.Sequential(nn.Linear(in_dim, HIDDEN_DIM), nn.ReLU(), nn.Linear(HIDDEN_DIM, cache_size + 1))
+        self.in_proj = nn.Sequential(nn.Linear(in_dim, LSTM_INPUT_DIM), nn.ReLU())
+        self.lstm = nn.LSTM(LSTM_INPUT_DIM, HIDDEN_DIM, batch_first=True)
+        self.out = nn.Sequential(nn.Linear(HIDDEN_DIM, 128), nn.ReLU(), nn.Linear(128, cache_size + 1))
 
     def init_hidden(self, B: int):
-        if not self.use_lstm:
-            return None
         h = torch.zeros(1, B, HIDDEN_DIM, device=self.device)
         c = torch.zeros(1, B, HIDDEN_DIM, device=self.device)
         return (h, c)
@@ -290,28 +250,19 @@ class PoolingQNet(nn.Module):
         slot_emb = self.slot_proj(cache_feat)
         pooled = pool_meanmaxmin(slot_emb)
         x = pooled if not self.use_global else torch.cat([pooled, global_feat], dim=1)
-        if self.use_lstm:
-            x = self.in_proj(x).unsqueeze(1)
-            out, hidden = self.lstm(x, hidden)
-            q = self.out(out[:, -1, :])
-            return q, hidden
-        q = self.ff(x)
-        return q, None
+        x = self.in_proj(x).unsqueeze(1)
+        out, hidden = self.lstm(x, hidden)
+        q = self.out(out[:, -1, :])
+        return q, hidden
 
 
 def build_models(cache_size: int, s, device: torch.device):
     if s.algo == "drqn_perslot":
         online = DRQN_PerSlot(cache_size, s.use_global, device).to(device)
         target = DRQN_PerSlot(cache_size, s.use_global, device).to(device)
-    elif s.algo == "dqn_perslot":
-        online = DQN_PerSlot(cache_size, s.use_global).to(device)
-        target = DQN_PerSlot(cache_size, s.use_global).to(device)
     elif s.algo == "pooling_lstm":
-        online = PoolingQNet(cache_size, s.use_global, use_lstm=True, device=device).to(device)
-        target = PoolingQNet(cache_size, s.use_global, use_lstm=True, device=device).to(device)
-    elif s.algo == "pooling_ff":
-        online = PoolingQNet(cache_size, s.use_global, use_lstm=False, device=device).to(device)
-        target = PoolingQNet(cache_size, s.use_global, use_lstm=False, device=device).to(device)
+        online = PoolingQNet(cache_size, s.use_global, device=device).to(device)
+        target = PoolingQNet(cache_size, s.use_global, device=device).to(device)
     else:
         raise ValueError(s.algo)
 

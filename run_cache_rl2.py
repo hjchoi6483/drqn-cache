@@ -56,14 +56,6 @@ except Exception as e:
     )
 
 try:
-    from tqdm.auto import tqdm
-except Exception as e:
-    raise RuntimeError(
-        "tqdm가 필요함. 예) pip install tqdm\n"
-        f"원인: {repr(e)}"
-    )
-
-try:
     from optuna.exceptions import TrialPruned
 except Exception as e:
     raise RuntimeError(
@@ -142,7 +134,7 @@ CONFIG = {
     "SCENARIOS": ["zipf"],
 
     # baseline list (Step A multi-baseline-ready schema)
-    "BASELINES": ["lru"],
+    "BASELINES": ["lru", "arc"],
 
 
     # training
@@ -229,7 +221,7 @@ if ARGS.use_quick_preset:
 # =========================
 @dataclass(frozen=True)
 class Setting:
-    # algo: "drqn_perslot", "dqn_perslot", "pooling_lstm", "pooling_ff"
+    # algo: "drqn_perslot", "pooling_lstm"
     algo: str
     use_global: bool
     invalid_penalty: bool
@@ -238,12 +230,8 @@ def setting_name(s: Setting) -> str:
     return f"{s.algo}|G{int(s.use_global)}|P{int(s.invalid_penalty)}"
 
 SETTINGS: List[Setting] = [
-    Setting("drqn_perslot", True,  True),   # main
-    Setting("drqn_perslot", False, True),   # global ablation
-    Setting("drqn_perslot", True,  False),  # penalty ablation
-    Setting("dqn_perslot",  True,  True),   # memory(LSTM) ablation
-    Setting("pooling_lstm", True,  True),
-    Setting("pooling_ff",   True,  True),
+    Setting("drqn_perslot", True, False),
+    Setting("pooling_lstm", True, True),
 ]
 
 
@@ -439,11 +427,11 @@ def train_one_run(
     target_every = int(CONFIG["TARGET_UPDATE_EVERY_UPDATES"])
 
     t0 = time.time()
-    pbar = tqdm(range(st.ep_done + 1, max_eps + 1), desc=f"TRAIN {rid}", leave=True)
+    print(f"[RUN START] {rid} | scenario={scenario} alpha={alpha} cache={cache_size} seed={seed}", flush=True)
 
     interrupted = False
     try:
-        for ep in pbar:
+        for ep in range(st.ep_done + 1, max_eps + 1):
             if st.train_cursor + ep_len >= len(train_ids):
                 break
 
@@ -488,13 +476,6 @@ def train_one_run(
                 res = eval_policy(online, scenario, alpha, test_full, cache_size, s, eval_kind="full")
                 eval_rec.update({f"full_{k}": v for k, v in res.items()})
 
-            pbar.set_postfix({
-                "eps": f"{eps:.3f}",
-                "hit%": f"{hit_proxy:.2f}",
-                "loss": f"{avg_loss:.4f}",
-                "replay": len(replay),
-                "upd": st.total_updates,
-            })
 
             rec = {
                 "run_id": rid,
@@ -593,30 +574,41 @@ def objective(trial: optuna.trial.Trial, stream_cache: Dict[Tuple[str, float, in
     CONFIG["UNROLL"] = trial.suggest_int("UNROLL", 20, 80, step=10)
     CONFIG["BATCH_SIZE"] = trial.suggest_categorical("BATCH_SIZE", [16, 32, 64])
 
-    scenario = "zipf"
-    alpha = 1.3
-    cache_size = 16
-    seed = int(CONFIG["SEEDS"][0])
-    s = SETTINGS[0]
+    scenario_grid = [
+        ("zipf", 1.3, 16),
+        ("zipf", 1.3, 64),
+        ("zipf", 1.8, 16),
+        ("zipf", 1.8, 64),
+    ]
 
-    gk = (scenario, float(alpha), seed)
-    streams = stream_cache[gk]
-    row = train_one_run(
-        scenario=scenario,
-        alpha=alpha,
-        cache_size=cache_size,
-        seed=seed,
-        s=s,
-        train_ids=streams["train"],
-        test_fast=streams["fast"],
-        test_full=streams["full"],
-        trial=trial,
-        persist_result=False,
-        run_suffix=f"optuna_t{trial.number}",
-    )
-    if row is None:
-        return 0.0
-    return float(row["rl_hit"])
+    seed = int(CONFIG["SEEDS"][0])
+    setting = SETTINGS[0]
+    scores: List[float] = []
+
+    for idx, (scenario, alpha, cache_size) in enumerate(scenario_grid):
+        gk = (scenario, float(alpha), seed)
+        streams = stream_cache[gk]
+        row = train_one_run(
+            scenario=scenario,
+            alpha=alpha,
+            cache_size=cache_size,
+            seed=seed,
+            s=setting,
+            train_ids=streams["train"],
+            test_fast=streams["fast"],
+            test_full=streams["full"],
+            trial=trial,
+            persist_result=False,
+            run_suffix=f"optuna_t{trial.number}_s{idx}",
+        )
+        if row is None:
+            return 0.0
+        scores.append(float(row["rl_hit"]))
+        trial.report(float(np.mean(scores)), idx + 1)
+        if trial.should_prune():
+            raise TrialPruned(f"Pruned at scenario #{idx + 1} with mean={np.mean(scores):.4f}")
+
+    return float(np.mean(scores)) if scores else 0.0
 
 
 def optimize_hparams(stream_cache: Dict[Tuple[str, float, int], Dict[str, List[int]]]) -> Dict[str, float]:
@@ -729,11 +721,7 @@ def run_all():
 
     print(f"Remaining runs: {len(tasks)}")
 
-    master = tqdm(tasks, desc="ALL RUNS", leave=True)
-    for scenario, alpha, cache_size, seed, s in master:
-        master.set_postfix({
-            "scenario": scenario, "alpha": alpha, "S": cache_size, "seed": seed, "setting": setting_name(s)
-        })
+    for scenario, alpha, cache_size, seed, s in tasks:
 
         gk = (scenario, float(alpha), int(seed))
         train_ids = stream_cache[gk]["train"]
