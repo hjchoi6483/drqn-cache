@@ -3,7 +3,7 @@
 # + Quick preset (--use_quick_preset) with practical FULL eval
 #
 # ✅ NO HMIX: HMIX 관련 코드/파라미터/결과 컬럼 전부 제거
-# ✅ alpha: 1.3, 1.4, 1.5, 1.6, 1.7, 1.8   (요청 반영)
+
 #
 # Run (paper-grade default):
 #   python run_cache_rl_vscode_nohmix_quick.py --out_dir out --device cuda
@@ -43,7 +43,7 @@ from src.models.drqn import (
     select_action,
     train_step,
 )
-from src.workload.builder import build_trace
+from src.workload.builder import build_trace_with_meta
 
 # ---- Dependency check ----
 try:
@@ -126,12 +126,15 @@ CONFIG = {
     "NUM_REQUESTS": 1_000_000,
     "TRAIN_RATIO": 0.8,
 
-    # ✅ alpha list (요청)
-    "ZIPF_ALPHAS": [1.3, 1.4, 1.5, 1.6, 1.7, 1.8],
+    "ZIPF_ALPHAS": [0.6, 0.99, 1.3, 1.6],
+    "PHASE_ALPHAS": [0.6, 1.1, 1.6],
+    "ALPHA_SWITCH_EVERY": 1000,
+    "ALPHA_SCHEDULE_MODE": "cyclic",
+    "ALPHA_JUMP_PROB": 0.15,
 
     # cache sizes / scenarios
     "CACHE_SIZES": [16, 64],
-    "SCENARIOS": ["zipf"],
+    "SCENARIOS": ["zipf_static", "zipf_phase_shift", "zipf_random_jump"],
 
     # baseline list (Step A multi-baseline-ready schema)
     "BASELINES": ["lru", "arc"],
@@ -188,11 +191,14 @@ def apply_quick_preset():
         "EXPERIMENT_TAG": "quick",
         "NUM_REQUESTS": 250_000,
 
-        # alpha는 요청대로 1.3~1.8 유지
-        "ZIPF_ALPHAS": [1.3, 1.4, 1.5, 1.6, 1.7, 1.8],
+        "ZIPF_ALPHAS": [0.6, 0.99, 1.3, 1.6],
+        "PHASE_ALPHAS": [0.6, 1.1, 1.6],
+        "ALPHA_SWITCH_EVERY": 500,
+        "ALPHA_SCHEDULE_MODE": "cyclic",
+        "ALPHA_JUMP_PROB": 0.20,
 
         "CACHE_SIZES": [16, 64],
-        "SCENARIOS": ["zipf"],
+        "SCENARIOS": ["zipf_static", "zipf_phase_shift", "zipf_random_jump"],
         "SEEDS": [0, 1],
 
         # shorter training
@@ -242,6 +248,23 @@ def run_id(scenario: str, alpha: float, cache_size: int, seed: int, s: Setting) 
     tag = str(CONFIG.get("EXPERIMENT_TAG", "default"))
     return f"{tag}_{scenario}_a{alpha}_S{cache_size}_seed{seed}_{setting_name(s)}"
 
+
+def scenario_alpha_grid(scenario: str) -> List[float]:
+    if scenario in {"zipf", "zipf_static"}:
+        return [float(a) for a in CONFIG["ZIPF_ALPHAS"]]
+    return [-1.0]
+
+
+def workload_descriptor(scenario: str, alpha: float, meta: Dict[str, object] | None) -> str:
+    if scenario in {"zipf", "zipf_static"}:
+        return f"static_a{alpha}"
+    if not meta:
+        return scenario
+    return (
+        f"{scenario}_ph{meta.get('phase_alphas')}_sw{meta.get('switch_every')}"
+        f"_mode{meta.get('mode')}_jump{meta.get('jump_prob', 0.0)}"
+    )
+
 def safe_filename(s: str) -> str:
     bad = '<>:"/\\|?*'
     for ch in bad:
@@ -277,6 +300,11 @@ def results_csv_path() -> str:
 
 def summary_csv_path() -> str:
     return os.path.join(CONFIG["OUT_DIR"], "summary.csv")
+
+
+def workload_meta_path(scenario: str, alpha: float, seed: int) -> str:
+    name = safe_filename(f"{scenario}_a{alpha}_seed{seed}.json")
+    return os.path.join(CONFIG["OUT_DIR"], "logs", f"workload_{name}")
 
 def write_row_csv(path: str, row: dict):
     exists = os.path.exists(path)
@@ -346,6 +374,7 @@ class TrainState:
     cache_size: int
     seed: int
     setting: str
+    workload_desc: str
     ep_done: int
     global_step: int
     train_cursor: int
@@ -381,6 +410,7 @@ def train_one_run(
     train_ids: List[int],
     test_fast: List[int],
     test_full: List[int],
+    workload_meta: Dict[str, object] | None = None,
     trial: optuna.trial.Trial | None = None,
     persist_result: bool = True,
     run_suffix: str | None = None,
@@ -399,7 +429,9 @@ def train_one_run(
 
     loaded = load_ckpt(rid)
     if loaded is not None:
-        st = TrainState(**loaded["state"])
+        loaded_state = dict(loaded["state"])
+        loaded_state.setdefault("workload_desc", workload_descriptor(scenario, alpha, workload_meta))
+        st = TrainState(**loaded_state)
         online, target = build_models(cache_size, s, DEVICE)
         online.load_state_dict(loaded["online"])
         target.load_state_dict(loaded["target"])
@@ -415,6 +447,7 @@ def train_one_run(
         st = TrainState(
             rid=rid, scenario=scenario, alpha=float(alpha), cache_size=int(cache_size),
             seed=int(seed), setting=setting_name(s),
+            workload_desc=workload_descriptor(scenario, alpha, workload_meta),
             ep_done=0, global_step=0, train_cursor=0, total_updates=0, loss_tail=[]
         )
 
@@ -427,7 +460,11 @@ def train_one_run(
     target_every = int(CONFIG["TARGET_UPDATE_EVERY_UPDATES"])
 
     t0 = time.time()
-    print(f"[RUN START] {rid} | scenario={scenario} alpha={alpha} cache={cache_size} seed={seed}", flush=True)
+    print(
+        f"[RUN START] {rid} | scenario={scenario} alpha={alpha} cache={cache_size} "
+        f"seed={seed} workload={st.workload_desc}",
+        flush=True,
+    )
 
     interrupted = False
     try:
@@ -484,6 +521,8 @@ def train_one_run(
                 "cache_size": cache_size,
                 "seed": seed,
                 "setting": setting_name(s),
+                "workload_desc": st.workload_desc,
+                "workload_meta": json.dumps(workload_meta, ensure_ascii=False) if workload_meta else "",
                 "episode": ep,
                 "global_step": st.global_step,
                 "epsilon": eps,
@@ -529,6 +568,8 @@ def train_one_run(
         "algo": s.algo,
         "use_global": int(s.use_global),
         "invalid_penalty": int(s.invalid_penalty),
+        "workload_desc": st.workload_desc,
+        "workload_meta": json.dumps(workload_meta, ensure_ascii=False) if workload_meta else "",
 
         "train_episodes": int(st.ep_done),
         "total_updates": int(st.total_updates),
@@ -552,33 +593,41 @@ def train_one_run(
     return row
 
 
-def build_stream_cache() -> Dict[Tuple[str, float, int], Dict[str, List[int]]]:
-    stream_cache: Dict[Tuple[str, float, int], Dict[str, List[int]]] = {}
+def build_stream_cache() -> Dict[Tuple[str, float, int], Dict[str, object]]:
+    stream_cache: Dict[Tuple[str, float, int], Dict[str, object]] = {}
     for scenario in CONFIG["SCENARIOS"]:
-        for alpha in CONFIG["ZIPF_ALPHAS"]:
+        for alpha in scenario_alpha_grid(scenario):
             for seed in CONFIG["SEEDS"]:
                 gk = (scenario, float(alpha), int(seed))
-                req_stream = build_trace(CONFIG, scenario, alpha, seed, set_seed)
+                req_stream, workload_meta = build_trace_with_meta(CONFIG, scenario, alpha, seed, set_seed)
                 split = int(len(req_stream) * float(CONFIG["TRAIN_RATIO"]))
                 stream_cache[gk] = {
                     "train": req_stream[:split],
                     "fast": req_stream[split: split + int(CONFIG["FAST_EVAL_STEPS"])],
                     "full": req_stream[split: split + int(CONFIG["FULL_EVAL_STEPS"])],
+                    "meta": workload_meta,
                 }
+                with open(workload_meta_path(scenario, alpha, seed), "w", encoding="utf-8") as f:
+                    json.dump({
+                        "scenario": scenario,
+                        "alpha": float(alpha),
+                        "seed": int(seed),
+                        "meta": workload_meta,
+                    }, f, ensure_ascii=False, indent=2)
     return stream_cache
 
 
-def objective(trial: optuna.trial.Trial, stream_cache: Dict[Tuple[str, float, int], Dict[str, List[int]]]) -> float:
+def objective(trial: optuna.trial.Trial, stream_cache: Dict[Tuple[str, float, int], Dict[str, object]]) -> float:
     CONFIG["LR"] = trial.suggest_float("LR", 1e-5, 1e-3, log=True)
     CONFIG["GAMMA"] = trial.suggest_float("GAMMA", 0.9, 0.999)
     CONFIG["UNROLL"] = trial.suggest_int("UNROLL", 20, 80, step=10)
     CONFIG["BATCH_SIZE"] = trial.suggest_categorical("BATCH_SIZE", [16, 32, 64])
 
     scenario_grid = [
-        ("zipf", 1.3, 16),
-        ("zipf", 1.3, 64),
-        ("zipf", 1.8, 16),
-        ("zipf", 1.8, 64),
+        ("zipf_static", 0.99, 16),
+        ("zipf_static", 1.6, 64),
+        ("zipf_phase_shift", -1.0, 16),
+        ("zipf_random_jump", -1.0, 64),
     ]
 
     seed = int(CONFIG["SEEDS"][0])
@@ -597,6 +646,7 @@ def objective(trial: optuna.trial.Trial, stream_cache: Dict[Tuple[str, float, in
             train_ids=streams["train"],
             test_fast=streams["fast"],
             test_full=streams["full"],
+            workload_meta=streams.get("meta"),
             trial=trial,
             persist_result=False,
             run_suffix=f"optuna_t{trial.number}_s{idx}",
@@ -611,7 +661,7 @@ def objective(trial: optuna.trial.Trial, stream_cache: Dict[Tuple[str, float, in
     return float(np.mean(scores)) if scores else 0.0
 
 
-def optimize_hparams(stream_cache: Dict[Tuple[str, float, int], Dict[str, List[int]]]) -> Dict[str, float]:
+def optimize_hparams(stream_cache: Dict[Tuple[str, float, int], Dict[str, object]]) -> Dict[str, float]:
     print("\n[OPTUNA] Starting hyperparameter optimization...")
     study = optuna.create_study(
         direction="maximize",
@@ -710,7 +760,7 @@ def run_all():
 
     tasks = []
     for scenario in CONFIG["SCENARIOS"]:
-        for alpha in CONFIG["ZIPF_ALPHAS"]:
+        for alpha in scenario_alpha_grid(scenario):
             for cache_size in CONFIG["CACHE_SIZES"]:
                 for seed in CONFIG["SEEDS"]:
                     for s in SETTINGS:
@@ -727,6 +777,7 @@ def run_all():
         train_ids = stream_cache[gk]["train"]
         test_fast = stream_cache[gk]["fast"]
         test_full = stream_cache[gk]["full"]
+        workload_meta = stream_cache[gk].get("meta")
 
         train_one_run(
             scenario=scenario,
@@ -737,6 +788,7 @@ def run_all():
             train_ids=train_ids,
             test_fast=test_fast,
             test_full=test_full,
+            workload_meta=workload_meta,
         )
 
         build_summary()
