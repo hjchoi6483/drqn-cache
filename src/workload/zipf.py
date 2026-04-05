@@ -4,10 +4,29 @@ from typing import Dict, List, Tuple
 
 import numpy as np
 
+_FINITE_ZIPF_P_CACHE: Dict[Tuple[int, float], np.ndarray] = {}
+
+
+def _finite_zipf_probs(vocab_size: int, alpha: float) -> np.ndarray:
+    key = (int(vocab_size), float(alpha))
+    if key in _FINITE_ZIPF_P_CACHE:
+        return _FINITE_ZIPF_P_CACHE[key]
+
+    ranks = np.arange(1, int(vocab_size) + 1, dtype=np.float64)
+    weights = 1.0 / np.power(ranks, float(alpha))
+    probs = weights / weights.sum()
+    _FINITE_ZIPF_P_CACHE[key] = probs
+    return probs
+
 
 def trace_zipf(num_requests: int, vocab_size: int, alpha: float) -> List[int]:
-    samples = np.random.zipf(a=alpha, size=num_requests)
-    ids = (samples % vocab_size) + 1
+    if vocab_size <= 0:
+        raise ValueError("vocab_size must be > 0")
+    if alpha <= 0:
+        raise ValueError("alpha must be > 0")
+
+    probs = _finite_zipf_probs(vocab_size, alpha)
+    ids = np.random.choice(np.arange(1, vocab_size + 1, dtype=np.int64), size=num_requests, p=probs)
     return ids.astype(np.int64).tolist()
 
 
