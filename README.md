@@ -1,62 +1,45 @@
 # drqn-cache
 
-캐시 교체 강화학습 실험을 위한 러너입니다. 현재 코드는 **2개 RL 모델(최고 성능 조합만 유지)** + **2개 고전 베이스라인(LRU, ARC)** 비교에 최적화되어 있습니다.
+DRQN 기반 캐시 교체 정책을 학습하고, 고전 알고리즘(LRU/ARC)과 동일한 요청 트레이스에서 비교 평가하는 실험 러너입니다.
 
-## 이번 리팩토링 핵심 변경점
+## 핵심 특징
 
-1. **모델 축소/정리**
-   - 유지 모델:
-     - `drqn_perslot|G1|P0` (Global feature 사용, Invalid penalty 미사용)
-     - `pooling_lstm|G1|P1`
-   - 제거 모델:
-     - `dqn_perslot`
-     - `pooling_ff`
-     - 기타 DRQN ablation 조합 (`G0`, `P1` 등)
-
-2. **Optuna objective 범용화 (Option 2)**
-   - 단일 환경(`alpha=1.3, cache=16`) 최적화 방식 제거
-   - 하나의 trial에서 대표 시나리오를 모두 짧게 평가 후 평균 성능을 objective로 반환
-   - 현재 trial 내부 평가 그리드:
-     - `(zipf, 1.3, 16)`
-     - `(zipf, 1.3, 64)`
-     - `(zipf, 1.8, 16)`
-     - `(zipf, 1.8, 64)`
-
-3. **ARC baseline 추가**
-   - `src/baselines/arc.py`에 ARC(T1/T2/B1/B2 + `p` 적응 로직) 구현
-   - baseline factory와 실험 러너에 `arc` 연동
-   - 결과 CSV/요약에서 RL vs LRU vs ARC 비교 가능
-
-4. **로그 출력 단순화**
-   - tqdm 기반 반복 진행바 출력 제거
-   - 각 run에 대해 **시작 시점**과 **완료 시점(최종 성능)**만 출력
-   - Colab/CLI 로그 길이 과다 문제 완화
+- **RL 모델 2종 비교**
+  - `drqn_perslot|G1|P0`
+  - `pooling_lstm|G1|P1`
+- **베이스라인 2종 내장**
+  - `lru`
+  - `arc`
+- **Optuna 하이퍼파라미터 탐색**
+  - 단일 환경 과적합을 피하기 위해 4개 대표 시나리오 평균 점수 사용
+- **결과 자동 저장**
+  - `results.csv`, `summary.csv`, `best_params.json`, 로그/체크포인트 파일
 
 ---
 
-## 프로젝트 구조
+## 저장소 구조
 
 - `run_cache_rl2.py`
   - 전체 실험 오케스트레이션
-  - Optuna 최적화 + 매트릭스 실행
-  - run 결과 저장(`results.csv`) 및 집계(`summary.csv`)
+  - Optuna 실행, 학습/평가 루프, 결과 저장
 - `src/models/drqn.py`
-  - CacheEnv, replay, 학습 루프 유틸
-  - 유지 모델 2종(`DRQN_PerSlot`, `PoolingQNet(LSTM)`)
+  - `CacheEnv`, Replay 버퍼, DRQN/PoolingLSTM 모델, 학습 유틸
+- `src/workload/zipf.py`
+  - Zipf 요청 트레이스 생성
+- `src/workload/builder.py`
+  - 시나리오별 트레이스 빌더 (`zipf` 지원)
 - `src/baselines/lru.py`
   - LRU 시뮬레이터
 - `src/baselines/arc.py`
-  - ARC 시뮬레이터
+  - ARC 시뮬레이터 (`T1/T2/B1/B2`, 적응 파라미터 `p`)
 - `src/baselines/factory.py`
-  - baseline name → simulator 생성
+  - 문자열 이름 기반 베이스라인 팩토리
 - `src/evaluation/evaluator.py`
-  - RL 정책 및 baseline 공통 평가
+  - RL/베이스라인 공통 평가 및 캐시
 
 ---
 
-## 실행 방법
-
-### 1) 환경 준비
+## 실행 환경
 
 ```bash
 python -m venv .venv
@@ -65,53 +48,83 @@ pip install -U pip
 pip install -r requirements-colab.txt
 ```
 
-### 2) Quick preset
+---
+
+## 실행 방법
+
+### 1) Quick preset
 
 ```bash
 python run_cache_rl2.py --out_dir out_quick --device cpu --use_quick_preset --optuna_trials 30
 ```
 
-### 3) Full run
+### 2) Full run
 
 ```bash
 python run_cache_rl2.py --out_dir out_full --device cpu --optuna_trials 40
 ```
 
----
-
-## Optuna 동작 방식
-
-`run_all()` 시작 시 study를 1회 실행하고 best param을 `best_params.json`에 저장합니다.
-
-- 탐색 파라미터
-  - `LR`: `1e-5 ~ 1e-3` (log)
-  - `GAMMA`: `0.9 ~ 0.999`
-  - `UNROLL`: `20 ~ 80` (step=10)
-  - `BATCH_SIZE`: `[16, 32, 64]`
-- objective
-  - trial 1개당 대표 4개 시나리오를 순차 학습/평가
-  - `rl_hit` 평균값을 최종 objective로 사용
-  - 중간 평균 기반 pruning 적용
-
-이 방식으로 특정 단일 환경에 과적합되는 위험을 줄이고, 더 robust한 파라미터를 찾도록 했습니다.
+> GPU 사용 시 `--device cuda` 또는 `--device cuda:0` 지정.
 
 ---
 
-## 결과 파일
+## 기본 설정(코드 기준)
+
+`run_cache_rl2.py`의 기본값은 아래와 같습니다.
+
+- 요청 수: `1,000,000`
+- Zipf alpha: `[1.3, 1.4, 1.5, 1.6, 1.7, 1.8]`
+- 캐시 크기: `[16, 64]`
+- 시나리오: `zipf`
+- seed: `[0]`
+- 학습 에피소드: 최대 `400`
+
+Quick preset(`--use_quick_preset`) 적용 시:
+
+- 요청 수: `250,000`
+- seed: `[0, 1]`
+- 학습/평가 스텝 축소 (빠른 smoke + 트렌드 확인용)
+
+---
+
+## Optuna objective 설계
+
+각 trial에서 아래 4개 조합을 짧게 학습/평가하고, `rl_hit` 평균을 objective로 사용합니다.
+
+- `(zipf, 1.3, 16)`
+- `(zipf, 1.3, 64)`
+- `(zipf, 1.8, 16)`
+- `(zipf, 1.8, 64)`
+
+탐색 파라미터:
+
+- `LR`: `1e-5 ~ 1e-3` (log)
+- `GAMMA`: `0.9 ~ 0.999`
+- `UNROLL`: `20 ~ 80` (step=10)
+- `BATCH_SIZE`: `[16, 32, 64]`
+
+---
+
+## 출력 파일
 
 - `OUT_DIR/best_params.json`: Optuna 최고 파라미터
 - `OUT_DIR/results.csv`: run-level 결과
 - `OUT_DIR/summary.csv`: 그룹 집계 결과
 - `OUT_DIR/logs/*.jsonl`: 에피소드 로그
-- `OUT_DIR/ckpt/*.pt`: 체크포인트
+- `OUT_DIR/ckpt/*.pt`: 모델 체크포인트
 
 ---
 
-## 출력 로그 예시
+## 코드 리뷰 기준 확인 포인트
 
-- Run 시작 시:
-  - `[RUN START] ...`
-- Run 종료 시:
-  - `[DONE] ... | RL xx.xx  LRU xx.xx ARC xx.xx`
+전체 코드 기준으로 아래 사항이 보장되도록 구성되어 있습니다.
 
-진행률 바를 제거해 노이즈를 줄이고 핵심 정보만 남겼습니다.
+1. **베이스라인 공정성**
+   - RL과 LRU/ARC 모두 동일 `test_stream`으로 평가
+2. **중복 계산 최소화**
+   - 베이스라인 결과는 `(scenario, alpha, cache_size, eval_kind, names)` 키로 캐시
+3. **안전한 디바이스 설정**
+   - CUDA 요청 시 사용 가능 여부/인덱스 유효성 검사
+4. **행동 제약 일관성**
+   - `valid_action_mask`로 hit/empty 상태에서 `NOOP`만 유효하게 처리
+
