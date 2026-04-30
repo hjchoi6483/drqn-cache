@@ -141,6 +141,8 @@ CONFIG = {
     "EPISODE_LEN": 4000,
     "MAX_TRAIN_EPISODES": 400,
     "REPLAY_MAX_EPISODES": 800,
+    "PER_ALPHA": 0.6,
+    "PER_EPS": 1e-4,
     "BATCH_SIZE": 32,
     "BURN_IN": 20,
     "UNROLL": 40,
@@ -359,7 +361,7 @@ def save_ckpt(rid: str, online, target, optimizer, replay: EpisodeReplay, st: Tr
         "online": online.state_dict(),
         "target": target.state_dict(),
         "opt": optimizer.state_dict(),
-        "replay": replay.episodes,
+        "replay": replay.state_dict(),
     }, ckpt_path(rid))
 
 def load_ckpt(rid: str):
@@ -405,13 +407,21 @@ def train_one_run(
         target.load_state_dict(loaded["target"])
         optimizer = optim.Adam(online.parameters(), lr=float(CONFIG["LR"]))
         optimizer.load_state_dict(loaded["opt"])
-        replay = EpisodeReplay(int(CONFIG["REPLAY_MAX_EPISODES"]))
-        replay.episodes = loaded["replay"]
+        replay = EpisodeReplay(
+            int(CONFIG["REPLAY_MAX_EPISODES"]),
+            alpha=float(CONFIG["PER_ALPHA"]),
+            eps=float(CONFIG["PER_EPS"]),
+        )
+        replay.load_state_dict(loaded["replay"])
         print(f"[RESUME] {rid} from ep={st.ep_done} cursor={st.train_cursor} upd={st.total_updates}", flush=True)
     else:
         online, target = build_models(cache_size, s, DEVICE)
         optimizer = optim.Adam(online.parameters(), lr=float(CONFIG["LR"]))
-        replay = EpisodeReplay(int(CONFIG["REPLAY_MAX_EPISODES"]))
+        replay = EpisodeReplay(
+            int(CONFIG["REPLAY_MAX_EPISODES"]),
+            alpha=float(CONFIG["PER_ALPHA"]),
+            eps=float(CONFIG["PER_EPS"]),
+        )
         st = TrainState(
             rid=rid, scenario=scenario, alpha=float(alpha), cache_size=int(cache_size),
             seed=int(seed), setting=setting_name(s),
@@ -573,6 +583,8 @@ def objective(trial: optuna.trial.Trial, stream_cache: Dict[Tuple[str, float, in
     CONFIG["GAMMA"] = trial.suggest_float("GAMMA", 0.9, 0.999)
     CONFIG["UNROLL"] = trial.suggest_int("UNROLL", 20, 80, step=10)
     CONFIG["BATCH_SIZE"] = trial.suggest_categorical("BATCH_SIZE", [16, 32, 64])
+    CONFIG["PER_ALPHA"] = trial.suggest_float("PER_ALPHA", 0.2, 1.0)
+    CONFIG["PER_EPS"] = trial.suggest_float("PER_EPS", 1e-6, 1e-2, log=True)
 
     scenario_grid = [
         ("zipf", 1.3, 16),
