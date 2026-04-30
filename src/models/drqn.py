@@ -135,27 +135,78 @@ class CacheEnv:
 
 
 class EpisodeReplay:
-    def __init__(self, max_episodes: int):
+    def __init__(self, max_episodes: int, alpha: float = 0.6, eps: float = 1e-4):
         self.episodes = deque(maxlen=max_episodes)
+        self.priorities = deque(maxlen=max_episodes)
+        self.alpha = float(alpha)
+        self.eps = float(eps)
 
     def __len__(self):
         return len(self.episodes)
 
     def add_episode(self, obs_list: List[Obs], ar_list: List[AR]):
         self.episodes.append((obs_list, ar_list))
+        max_p = max(self.priorities) if len(self.priorities) > 0 else 1.0
+        self.priorities.append(float(max_p))
 
     def sample_batch(self, batch_size: int, seq_len: int):
         batch_obs, batch_ar = [], []
+        sample_indices = []
+        sample_probs = []
+        is_weights = []
+
+        prios = np.asarray(self.priorities, dtype=np.float64)
+        if len(prios) == 0:
+            raise ValueError("Replay buffer is empty.")
+        scaled = np.power(prios + self.eps, self.alpha)
+        probs = scaled / scaled.sum()
+
         for _ in range(batch_size):
-            obs_list, ar_list = random.choice(self.episodes)
+            ep_idx = int(np.random.choice(len(self.episodes), p=probs))
+            sample_indices.append(ep_idx)
+            sample_probs.append(float(probs[ep_idx]))
+            obs_list, ar_list = self.episodes[ep_idx]
             T = len(ar_list)
             while T < seq_len + 1:
-                obs_list, ar_list = random.choice(self.episodes)
+                ep_idx = int(np.random.choice(len(self.episodes), p=probs))
+                sample_indices[-1] = ep_idx
+                sample_probs[-1] = float(probs[ep_idx])
+                obs_list, ar_list = self.episodes[ep_idx]
                 T = len(ar_list)
             start = random.randint(0, T - (seq_len + 1))
             batch_obs.append(obs_list[start : start + seq_len + 1])
             batch_ar.append(ar_list[start : start + seq_len])
-        return batch_obs, batch_ar
+
+        min_prob = float(np.min(probs))
+        n = float(len(self.episodes))
+        for p_i in sample_probs:
+            is_weights.append(min_prob / max(p_i, 1e-12))
+        is_weights = np.asarray(is_weights, dtype=np.float32)
+        return batch_obs, batch_ar, sample_indices, is_weights
+
+    def update_priorities(self, sample_indices: List[int], td_errors: np.ndarray):
+        if len(sample_indices) != len(td_errors):
+            raise ValueError("sample_indices and td_errors length mismatch")
+        for idx, td in zip(sample_indices, td_errors):
+            self.priorities[idx] = float(abs(td) + self.eps)
+
+    def state_dict(self):
+        return {
+            "episodes": self.episodes,
+            "priorities": self.priorities,
+            "alpha": self.alpha,
+            "eps": self.eps,
+        }
+
+    def load_state_dict(self, state):
+        if isinstance(state, dict):
+            self.episodes = state.get("episodes", deque(maxlen=self.episodes.maxlen))
+            self.priorities = state.get("priorities", deque(maxlen=self.priorities.maxlen))
+            self.alpha = float(state.get("alpha", self.alpha))
+            self.eps = float(state.get("eps", self.eps))
+        else:
+            self.episodes = state
+            self.priorities = deque([1.0] * len(self.episodes), maxlen=self.priorities.maxlen)
 
 
 CACHE_KEY_DIM = 32
@@ -296,7 +347,7 @@ def train_step(online, target, optimizer, replay: EpisodeReplay, cache_size: int
     L = int(config["BURN_IN"] + config["UNROLL"])
     A = cache_size + 1
 
-    batch_obs, batch_ar = replay.sample_batch(B, L)
+    batch_obs, batch_ar, sample_indices, is_weights_np = replay.sample_batch(B, L)
 
     cf_np = np.zeros((B, L + 1, cache_size, 2), dtype=np.float32)
     gf_np = np.zeros((B, L + 1, 3), dtype=np.float32)
@@ -323,6 +374,7 @@ def train_step(online, target, optimizer, replay: EpisodeReplay, cache_size: int
     act = torch.from_numpy(act_np).to(device)
     rew = torch.from_numpy(rew_np).to(device)
     done = torch.from_numpy(done_np).to(device)
+    is_w = torch.from_numpy(is_weights_np).to(device)
 
     h_on = online.init_hidden(B)
     h_tg = target.init_hidden(B)
@@ -339,6 +391,7 @@ def train_step(online, target, optimizer, replay: EpisodeReplay, cache_size: int
     q_tg_all = torch.stack(q_tg_all, dim=1)
 
     losses = []
+    td_error_acc = torch.zeros(B, device=device)
     burn = int(config["BURN_IN"])
     gamma = float(config["GAMMA"])
     for t in range(burn, L):
@@ -351,14 +404,18 @@ def train_step(online, target, optimizer, replay: EpisodeReplay, cache_size: int
             q_next_target = q_tg_all[:, t + 1, :].masked_fill(~mk[:, t + 1, :], float("-inf"))
             q_next = q_next_target.gather(1, best_a.unsqueeze(1)).squeeze(1)
             td = rew[:, t] + (~done[:, t]).float() * gamma * q_next
+            td_error_acc += torch.abs(td - q_sa)
 
-        losses.append(F.smooth_l1_loss(q_sa, td))
+        per_sample_loss = F.smooth_l1_loss(q_sa, td, reduction="none")
+        losses.append((per_sample_loss * is_w).mean())
 
     loss = torch.stack(losses).mean()
     optimizer.zero_grad(set_to_none=True)
     loss.backward()
     nn.utils.clip_grad_norm_(online.parameters(), float(config["GRAD_CLIP"]))
     optimizer.step()
+    avg_td_error = (td_error_acc / max(1, (L - burn))).detach().cpu().numpy()
+    replay.update_priorities(sample_indices, avg_td_error)
     return float(loss.item())
 
 
