@@ -25,6 +25,34 @@ class AR:
     done: bool
 
 
+
+
+class RunningScale:
+    """EMA-based dynamic normalizer for non-negative features."""
+
+    def __init__(self, init_scale: float, alpha: float, eps: float, min_scale: float, percentile: float):
+        self.scale = max(float(init_scale), float(min_scale), float(eps))
+        self.alpha = float(alpha)
+        self.eps = float(eps)
+        self.min_scale = float(min_scale)
+        self.percentile = float(percentile)
+
+    def update(self, values: List[float]):
+        if not values:
+            return
+        arr = np.asarray(values, dtype=np.float32)
+        arr = arr[np.isfinite(arr) & (arr > 0.0)]
+        if arr.size == 0:
+            return
+        stat = float(np.percentile(arr, self.percentile))
+        stat = max(stat, self.min_scale, self.eps)
+        self.scale = (1.0 - self.alpha) * self.scale + self.alpha * stat
+
+    def normalize(self, value: float) -> float:
+        denom = max(self.scale, self.min_scale) + self.eps
+        return float(np.clip(float(value) / denom, 0.0, 1.0))
+
+
 class CacheEnv:
     """
     action:
@@ -41,6 +69,16 @@ class CacheEnv:
         self.freq_denom = float(config["FREQ_DENOM"])
         self.hit_ema_alpha = float(config["HIT_EMA_ALPHA"])
         self.miss_streak_clip = int(config["MISS_STREAK_CLIP"])
+
+        self.feature_scaling_mode = str(config.get("FEATURE_SCALING_MODE", "static")).lower()
+        self.reward_mode = str(config.get("REWARD_MODE", "binary")).lower()
+        self.scaler_alpha = float(config.get("SCALER_EMA_ALPHA", 0.02))
+        self.scaler_eps = float(config.get("SCALER_EPS", 1e-6))
+        self.scaler_min_scale = float(config.get("SCALER_MIN_SCALE", 1.0))
+        self.scaler_percentile = float(config.get("SCALER_PERCENTILE", 90.0))
+        self.reward_norm_eps = float(config.get("REWARD_NORM_EPS", 1e-6))
+        self.reward_clip = float(config.get("REWARD_CLIP", 2.0))
+        self.invalid_action_reward = float(config.get("INVALID_ACTION_REWARD", -1.0))
         self.reset()
 
     def reset(self):
@@ -50,6 +88,9 @@ class CacheEnv:
         self.frequency = {}
         self.hit_ema = 0.0
         self.miss_streak = 0
+        self.recency_scale = RunningScale(self.rec_denom, self.scaler_alpha, self.scaler_eps, self.scaler_min_scale, self.scaler_percentile)
+        self.freq_scale = RunningScale(self.freq_denom, self.scaler_alpha, self.scaler_eps, self.scaler_min_scale, self.scaler_percentile)
+        self.miss_scale = RunningScale(self.miss_streak_clip, self.scaler_alpha, self.scaler_eps, self.scaler_min_scale, self.scaler_percentile)
 
     def _update_stats(self, req_id: int):
         self.access_history[req_id] = self.t
@@ -71,12 +112,30 @@ class CacheEnv:
     def get_cache_features(self) -> np.ndarray:
         feats = np.ones((self.cache_size, 2), dtype=np.float32)
         feats[:, 1] = 0.0
+
+        gaps, freqs = [], []
+        for item in self.cache_slots:
+            if item == 0:
+                continue
+            gaps.append(float(self.t - self.access_history.get(item, 0)))
+            freqs.append(float(self.frequency.get(item, 0)))
+
+        if self.feature_scaling_mode == "dynamic":
+            # Dynamic mode adapts feature scale to current workload and locality.
+            self.recency_scale.update(gaps)
+            self.freq_scale.update(freqs)
+
         for i, item in enumerate(self.cache_slots):
             if item == 0:
                 continue
-            gap = self.t - self.access_history.get(item, 0)
-            rec = min(gap / self.rec_denom, 1.0)
-            frq = min(self.frequency.get(item, 0) / self.freq_denom, 1.0)
+            gap = float(self.t - self.access_history.get(item, 0))
+            freq = float(self.frequency.get(item, 0))
+            if self.feature_scaling_mode == "dynamic":
+                rec = self.recency_scale.normalize(gap)
+                frq = self.freq_scale.normalize(freq)
+            else:
+                rec = min(gap / self.rec_denom, 1.0)
+                frq = min(freq / self.freq_denom, 1.0)
             feats[i, 0] = rec
             feats[i, 1] = frq
         return feats
@@ -85,7 +144,11 @@ class CacheEnv:
         if not self.use_global:
             return np.zeros((3,), dtype=np.float32)
         occupancy = 1.0 - (self.cache_slots.count(0) / float(self.cache_size))
-        miss_norm = min(self.miss_streak / float(self.miss_streak_clip), 1.0)
+        if self.feature_scaling_mode == "dynamic":
+            self.miss_scale.update([float(self.miss_streak)])
+            miss_norm = self.miss_scale.normalize(float(self.miss_streak))
+        else:
+            miss_norm = min(self.miss_streak / float(self.miss_streak_clip), 1.0)
         return np.asarray([occupancy, self.hit_ema, miss_norm], dtype=np.float32)
 
     def valid_action_mask(self, req_id: int) -> np.ndarray:
@@ -106,16 +169,27 @@ class CacheEnv:
         else:
             self.miss_streak = min(self.miss_streak + 1, self.miss_streak_clip)
 
+    def _reward_from_hit(self, hit: bool) -> float:
+        x = 1.0 if hit else 0.0
+        if self.reward_mode == "adaptive":
+            # Advantage-like shaping against previous running hit expectation.
+            p = float(np.clip(self.hit_ema, 0.0, 1.0))
+            std = float(np.sqrt(p * (1.0 - p) + self.reward_norm_eps))
+            rew = (x - p) / std
+            return float(np.clip(rew, -self.reward_clip, self.reward_clip))
+        return x
+
     def step(self, req_id: int, action: int) -> Tuple[float, bool]:
         self.t += 1
         self._update_stats(req_id)
 
         hit = self._has_item(req_id)
         if hit:
+            reward = self._reward_from_hit(True)
             self._update_global(True)
-            return 1.0, True
+            return reward, True
 
-        reward = 0.0
+        reward = self._reward_from_hit(False)
 
         if self._has_empty():
             self._fill_empty(req_id)
@@ -124,7 +198,7 @@ class CacheEnv:
 
         if action <= 0 or action > self.cache_size:
             if self.invalid_penalty:
-                reward = -1.0
+                reward = min(reward, self.invalid_action_reward)
             slot_idx = random.randrange(self.cache_size)
         else:
             slot_idx = action - 1
@@ -362,18 +436,20 @@ def train_step(online, target, optimizer, replay: EpisodeReplay, cache_size: int
     return float(loss.item())
 
 
-def rollout_episode(model, req_stream: List[int], start: int, length: int, cache_size: int, s, eps: float, config: Dict[str, object], device: torch.device) -> Tuple[List[Obs], List[AR], float]:
+def rollout_episode(model, req_stream: List[int], start: int, length: int, cache_size: int, s, eps: float, config: Dict[str, object], device: torch.device) -> Tuple[List[Obs], List[AR], Dict[str, float]]:
     env = CacheEnv(cache_size, use_global=s.use_global, invalid_penalty=s.invalid_penalty, config=config)
     hidden = model.init_hidden(1)
     model.eval()
 
     obs_list, ar_list = [], []
     total_rew = 0.0
+    hit_count = 0
+    miss_count = 0
 
     end = min(start + length, len(req_stream))
     T = end - start
     if T < 2:
-        return [], [], 0.0
+        return [], [], {"total_reward": 0.0, "hit_count": 0, "miss_count": 0}
 
     for i in range(T):
         req = req_stream[start + i]
@@ -384,8 +460,12 @@ def rollout_episode(model, req_stream: List[int], start: int, length: int, cache
         )
         obs_list.append(obs)
         a, hidden = select_action(model, obs, hidden, eps, device)
-        r, _ = env.step(req, a)
+        r, hit = env.step(req, a)
         total_rew += float(r)
+        if hit:
+            hit_count += 1
+        else:
+            miss_count += 1
         ar_list.append(AR(action=a, reward=float(r), done=(i == T - 1)))
 
     last_req = req_stream[end - 1]
@@ -396,7 +476,7 @@ def rollout_episode(model, req_stream: List[int], start: int, length: int, cache
             valid_mask=env.valid_action_mask(last_req),
         )
     )
-    return obs_list, ar_list, total_rew
+    return obs_list, ar_list, {"total_reward": total_rew, "hit_count": hit_count, "miss_count": miss_count}
 
 
 def make_env_for_eval(cache_size: int, s, config: Dict[str, object]) -> CacheEnv:

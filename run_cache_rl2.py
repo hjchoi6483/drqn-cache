@@ -157,13 +157,22 @@ CONFIG = {
     "EPSILON_END": 0.05,
     "EPSILON_DECAY_STEPS": 300_000,
 
-    # feature scaling (RL)
+    # feature scaling (RL): static fallback + dynamic default
     "RECENCY_DENOM": 2000.0,
     "FREQ_DENOM": 200.0,
+    "FEATURE_SCALING_MODE": "dynamic",
+    "SCALER_EMA_ALPHA": 0.02,
+    "SCALER_EPS": 1e-6,
+    "SCALER_MIN_SCALE": 1.0,
+    "SCALER_PERCENTILE": 90.0,
 
-    # global features
+    # global features + reward shaping
     "HIT_EMA_ALPHA": 0.01,
     "MISS_STREAK_CLIP": 200,
+    "REWARD_MODE": "adaptive",
+    "REWARD_NORM_EPS": 1e-6,
+    "REWARD_CLIP": 2.0,
+    "INVALID_ACTION_REWARD": -1.0,
 
     # eval schedule
     "FAST_EVAL_EVERY_EP": 5,
@@ -436,7 +445,7 @@ def train_one_run(
                 break
 
             eps = epsilon_by_step(st.global_step)
-            obs_list, ar_list, total_rew = rollout_episode(
+            obs_list, ar_list, rollout_stats = rollout_episode(
                 online, train_ids, st.train_cursor, ep_len, cache_size, s, eps, CONFIG, DEVICE
             )
             st.train_cursor += ep_len
@@ -461,7 +470,9 @@ def train_one_run(
                     target.load_state_dict(online.state_dict())
 
             avg_loss /= max(1, upd_per_ep)
-            hit_proxy = (total_rew / ep_len) * 100.0
+            total_rew = float(rollout_stats["total_reward"])
+            hit_count = float(rollout_stats["hit_count"])
+            hit_proxy = (hit_count / ep_len) * 100.0
 
             eval_rec = {}
             if ep % int(CONFIG["FAST_EVAL_EVERY_EP"]) == 0:
@@ -488,6 +499,7 @@ def train_one_run(
                 "global_step": st.global_step,
                 "epsilon": eps,
                 "train_hit_proxy": hit_proxy,
+                "train_total_reward": total_rew,
                 "avg_loss_ep": avg_loss,
                 "replay_episodes": len(replay),
                 "total_updates": st.total_updates,
