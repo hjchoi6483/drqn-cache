@@ -38,6 +38,7 @@ class CacheEnv:
         self.miss_streak_clip = int(config["MISS_STREAK_CLIP"])
         self.use_tinylfu_admission = bool(config.get("USE_TINYLFU_ADMISSION", False))
         self.use_admission_heuristic_mask = bool(config.get("USE_ADMISSION_HEURISTIC_MASK", False))
+        self.admission_features = bool(config.get("ADMISSION_FEATURES", True))
         self.recent_window_size = int(config.get("RECENT_WINDOW_SIZE", 1000))
         self.tinylfu_min_admit_count = int(config.get("TINYLFU_MIN_ADMIT_COUNT", 2))
         self.bypass_reward = float(config.get("BYPASS_REWARD", 0.0))
@@ -101,6 +102,14 @@ class CacheEnv:
             feats[i, 3] = 1.0 if self._total_count(item) < self.tinylfu_min_admit_count else 0.0
         return feats
 
+    def _req_hot_enough_for_admit(self, req_id: int) -> bool:
+        req_recent = self._recent_count(req_id)
+        cache_items = [it for it in self.cache_slots if it != 0]
+        if not cache_items:
+            return True
+        min_cache_recent = min(self._recent_count(it) for it in cache_items)
+        return req_recent >= min_cache_recent or self._total_count(req_id) >= self.tinylfu_min_admit_count
+
     def get_request_features(self, req_id: int) -> np.ndarray:
         seen = 1.0 if req_id in self.access_history else 0.0
         if seen > 0.0:
@@ -121,7 +130,10 @@ class CacheEnv:
             raw = np.clip((recent - min_cache_recent) / self.recent_freq_denom, -1.0, 1.0)
             hotness_vs_cache = (raw + 1.0) / 2.0
         feat = np.asarray([seen, req_recency, req_total_freq, req_recent_freq, req_is_cold, hotness_vs_cache], dtype=np.float32)
-        return np.clip(np.nan_to_num(feat, nan=0.0, posinf=1.0, neginf=0.0), 0.0, 1.0)
+        feat = np.clip(np.nan_to_num(feat, nan=0.0, posinf=1.0, neginf=0.0), 0.0, 1.0)
+        if not self.admission_features:
+            feat[:] = 0.0
+        return feat
 
     def get_global_features(self) -> np.ndarray:
         if not self.use_global:
@@ -137,12 +149,15 @@ class CacheEnv:
         if hit or empty:
             mask[0] = True
         elif self.use_tinylfu_admission:
-            mask[:] = True
+            mask[1:] = True
+            allow_bypass = True
             if self.use_admission_heuristic_mask:
+                allow_bypass = not self._req_hot_enough_for_admit(req_id)
                 req_recent = self._recent_count(req_id)
                 for idx, item in enumerate(self.cache_slots, start=1):
                     if self._recent_count(item) > req_recent:
                         mask[idx] = False
+            mask[0] = allow_bypass
         else:
             mask[1:] = True
         return mask

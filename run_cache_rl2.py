@@ -168,7 +168,7 @@ CONFIG = {
     "ADMISSION_FEATURES": True,
     "REQ_FREQ_DENOM": 50.0,
     "RECENT_FREQ_DENOM": 20.0,
-    "USE_ADMISSION_HEURISTIC_MASK": False,
+    "USE_ADMISSION_HEURISTIC_MASK": True,
 
     # global features
     "HIT_EMA_ALPHA": 0.01,
