@@ -158,6 +158,16 @@ class CacheEnv:
                     if self._recent_count(item) > req_recent:
                         mask[idx] = False
             mask[0] = allow_bypass
+            if not mask.any():
+                # Heuristic 마스킹으로 모든 액션이 막히지 않도록 안전장치:
+                # 최소 recent frequency 슬롯들은 항상 eviction 후보로 남긴다.
+                slot_recent = [self._recent_count(item) for item in self.cache_slots]
+                min_recent = min(slot_recent) if slot_recent else 0
+                for idx, recent in enumerate(slot_recent, start=1):
+                    if recent == min_recent:
+                        mask[idx] = True
+                if not mask.any():
+                    mask[0] = True
         else:
             mask[1:] = True
         return mask
