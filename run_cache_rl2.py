@@ -160,6 +160,15 @@ CONFIG = {
     # feature scaling (RL)
     "RECENCY_DENOM": 2000.0,
     "FREQ_DENOM": 200.0,
+    "USE_TINYLFU_ADMISSION": True,
+    "RECENT_WINDOW_SIZE": 1000,
+    "TINYLFU_COUNTER_DECAY": 0.99,
+    "TINYLFU_MIN_ADMIT_COUNT": 2,
+    "BYPASS_REWARD": 0.0,
+    "ADMISSION_FEATURES": True,
+    "REQ_FREQ_DENOM": 50.0,
+    "RECENT_FREQ_DENOM": 20.0,
+    "USE_ADMISSION_HEURISTIC_MASK": False,
 
     # global features
     "HIT_EMA_ALPHA": 0.01,
@@ -436,7 +445,7 @@ def train_one_run(
                 break
 
             eps = epsilon_by_step(st.global_step)
-            obs_list, ar_list, total_rew = rollout_episode(
+            obs_list, ar_list, ep_stats = rollout_episode(
                 online, train_ids, st.train_cursor, ep_len, cache_size, s, eps, CONFIG, DEVICE
             )
             st.train_cursor += ep_len
@@ -461,7 +470,7 @@ def train_one_run(
                     target.load_state_dict(online.state_dict())
 
             avg_loss /= max(1, upd_per_ep)
-            hit_proxy = (total_rew / ep_len) * 100.0
+            hit_proxy = (ep_stats["hit_count"] / max(1, ep_len)) * 100.0
 
             eval_rec = {}
             if ep % int(CONFIG["FAST_EVAL_EVERY_EP"]) == 0:
@@ -488,6 +497,11 @@ def train_one_run(
                 "global_step": st.global_step,
                 "epsilon": eps,
                 "train_hit_proxy": hit_proxy,
+                "train_total_reward": float(ep_stats["total_reward"]),
+                "bypass_count": int(ep_stats["bypass_count"]),
+                "insert_count": int(ep_stats["insert_count"]),
+                "eviction_count": int(ep_stats["eviction_count"]),
+                "bypass_rate": float(ep_stats["bypass_count"]) / max(1, int(ep_stats["miss_count"])),
                 "avg_loss_ep": avg_loss,
                 "replay_episodes": len(replay),
                 "total_updates": st.total_updates,
