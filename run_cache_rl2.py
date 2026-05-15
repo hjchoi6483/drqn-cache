@@ -160,6 +160,10 @@ CONFIG = {
     # feature scaling (RL)
     "RECENCY_DENOM": 2000.0,
     "FREQ_DENOM": 200.0,
+    "REQ_FREQ_DENOM": 50.0,
+    "USE_REQUEST_FEATURES": True,
+    "RECENT_WINDOW_SIZE": 1000,
+    "N_STEP": 5,
 
     # global features
     "HIT_EMA_ALPHA": 0.01,
@@ -436,7 +440,7 @@ def train_one_run(
                 break
 
             eps = epsilon_by_step(st.global_step)
-            obs_list, ar_list, total_rew = rollout_episode(
+            obs_list, ar_list, rollout_stats = rollout_episode(
                 online, train_ids, st.train_cursor, ep_len, cache_size, s, eps, CONFIG, DEVICE
             )
             st.train_cursor += ep_len
@@ -461,7 +465,8 @@ def train_one_run(
                     target.load_state_dict(online.state_dict())
 
             avg_loss /= max(1, upd_per_ep)
-            hit_proxy = (total_rew / ep_len) * 100.0
+            actual_steps = max(1, len(ar_list))
+            hit_proxy = (float(rollout_stats["hit_count"]) / actual_steps) * 100.0
 
             eval_rec = {}
             if ep % int(CONFIG["FAST_EVAL_EVERY_EP"]) == 0:
@@ -573,6 +578,7 @@ def objective(trial: optuna.trial.Trial, stream_cache: Dict[Tuple[str, float, in
     CONFIG["GAMMA"] = trial.suggest_float("GAMMA", 0.9, 0.999)
     CONFIG["UNROLL"] = trial.suggest_int("UNROLL", 20, 80, step=10)
     CONFIG["BATCH_SIZE"] = trial.suggest_categorical("BATCH_SIZE", [16, 32, 64])
+    CONFIG["N_STEP"] = trial.suggest_categorical("N_STEP", [1, 3, 5])
 
     scenario_grid = [
         ("zipf", 1.3, 16),
