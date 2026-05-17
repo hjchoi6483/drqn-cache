@@ -160,7 +160,7 @@ CONFIG = {
     # feature scaling (RL)
     "RECENCY_DENOM": 2000.0,
     "FREQ_DENOM": 200.0,
-    "USE_TINYLFU_ADMISSION": True,
+    "USE_TWO_STAGE_TINYLFU": True,
     "RECENT_WINDOW_SIZE": 1000,
     "TINYLFU_COUNTER_DECAY": 0.99,
     "TINYLFU_MIN_ADMIT_COUNT": 2,
@@ -168,7 +168,7 @@ CONFIG = {
     "ADMISSION_FEATURES": True,
     "REQ_FREQ_DENOM": 50.0,
     "RECENT_FREQ_DENOM": 20.0,
-    "USE_ADMISSION_HEURISTIC_MASK": True,
+    "USE_ADMISSION_HEURISTIC_MASK": False,
 
     # global features
     "HIT_EMA_ALPHA": 0.01,
@@ -499,9 +499,12 @@ def train_one_run(
                 "train_hit_proxy": hit_proxy,
                 "train_total_reward": float(ep_stats["total_reward"]),
                 "bypass_count": int(ep_stats["bypass_count"]),
+                "admit_count": int(ep_stats["admit_count"]),
+                "reject_count": int(ep_stats["reject_count"]),
                 "insert_count": int(ep_stats["insert_count"]),
                 "eviction_count": int(ep_stats["eviction_count"]),
                 "bypass_rate": float(ep_stats["bypass_count"]) / max(1, int(ep_stats["miss_count"])),
+                "admit_rate": float(ep_stats["admit_count"]) / max(1, int(ep_stats["miss_count"])),
                 "avg_loss_ep": avg_loss,
                 "replay_episodes": len(replay),
                 "total_updates": st.total_updates,
