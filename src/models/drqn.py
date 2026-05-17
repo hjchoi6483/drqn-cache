@@ -36,7 +36,7 @@ class CacheEnv:
         self.freq_denom = float(config["FREQ_DENOM"])
         self.hit_ema_alpha = float(config["HIT_EMA_ALPHA"])
         self.miss_streak_clip = int(config["MISS_STREAK_CLIP"])
-        self.use_tinylfu_admission = bool(config.get("USE_TINYLFU_ADMISSION", False))
+        self.use_two_stage_tinylfu = bool(config.get("USE_TWO_STAGE_TINYLFU", config.get("USE_TINYLFU_ADMISSION", False)))
         self.use_admission_heuristic_mask = bool(config.get("USE_ADMISSION_HEURISTIC_MASK", False))
         self.admission_features = bool(config.get("ADMISSION_FEATURES", True))
         self.recent_window_size = int(config.get("RECENT_WINDOW_SIZE", 1000))
@@ -55,6 +55,7 @@ class CacheEnv:
         self.recent_counts = {}
         self.hit_ema = 0.0
         self.miss_streak = 0
+        self.last_step_info = {}
 
     def _update_stats(self, req_id: int):
         self.access_history[req_id] = self.t
@@ -102,13 +103,23 @@ class CacheEnv:
             feats[i, 3] = 1.0 if self._total_count(item) < self.tinylfu_min_admit_count else 0.0
         return feats
 
-    def _req_hot_enough_for_admit(self, req_id: int) -> bool:
+    def should_admit(self, req_id: int) -> bool:
+        if not self.use_two_stage_tinylfu:
+            return True
+        if self._has_item(req_id) or self._has_empty():
+            return True
         req_recent = self._recent_count(req_id)
+        req_total = self._total_count(req_id)
         cache_items = [it for it in self.cache_slots if it != 0]
         if not cache_items:
             return True
         min_cache_recent = min(self._recent_count(it) for it in cache_items)
-        return req_recent >= min_cache_recent or self._total_count(req_id) >= self.tinylfu_min_admit_count
+        min_cache_total = min(self._total_count(it) for it in cache_items)
+        return (
+            req_recent >= min_cache_recent
+            or req_total >= self.tinylfu_min_admit_count
+            or req_total >= min_cache_total
+        )
 
     def get_request_features(self, req_id: int) -> np.ndarray:
         seen = 1.0 if req_id in self.access_history else 0.0
@@ -148,28 +159,13 @@ class CacheEnv:
         empty = self._has_empty()
         if hit or empty:
             mask[0] = True
-        elif self.use_tinylfu_admission:
-            mask[1:] = True
-            allow_bypass = True
-            if self.use_admission_heuristic_mask:
-                allow_bypass = not self._req_hot_enough_for_admit(req_id)
-                req_recent = self._recent_count(req_id)
-                for idx, item in enumerate(self.cache_slots, start=1):
-                    if self._recent_count(item) > req_recent:
-                        mask[idx] = False
-            mask[0] = allow_bypass
-            if not mask.any():
-                # Heuristic 마스킹으로 모든 액션이 막히지 않도록 안전장치:
-                # 최소 recent frequency 슬롯들은 항상 eviction 후보로 남긴다.
-                slot_recent = [self._recent_count(item) for item in self.cache_slots]
-                min_recent = min(slot_recent) if slot_recent else 0
-                for idx, recent in enumerate(slot_recent, start=1):
-                    if recent == min_recent:
-                        mask[idx] = True
-                if not mask.any():
-                    mask[0] = True
         else:
-            mask[1:] = True
+            if not self.use_two_stage_tinylfu:
+                mask[1:] = True
+            elif self.should_admit(req_id):
+                mask[1:] = True
+            else:
+                mask[0] = True
         return mask
 
     def _update_global(self, hit: bool):
@@ -182,30 +178,45 @@ class CacheEnv:
 
     def step(self, req_id: int, action: int) -> Tuple[float, bool]:
         self.t += 1
-        self._update_stats(req_id)
-
         if self._has_item(req_id):
+            self._update_stats(req_id)
             self._update_global(True)
+            self.last_step_info = {"hit": True, "miss": False, "admit": True, "bypass": False, "insert": False, "evict": False}
             return 1.0, True
 
         reward = 0.0
         if self._has_empty():
+            self._update_stats(req_id)
             self._fill_empty(req_id)
             self._update_global(False)
+            self.last_step_info = {"hit": False, "miss": True, "admit": True, "bypass": False, "insert": True, "evict": False}
             return reward, False
 
-        if self.use_tinylfu_admission and action == 0:
+        admit = True
+        if self.use_two_stage_tinylfu:
+            admit = self.should_admit(req_id)
+
+        if not admit:
+            self._update_stats(req_id)
             self._update_global(False)
+            self.last_step_info = {"hit": False, "miss": True, "admit": False, "bypass": True, "insert": False, "evict": False}
             return self.bypass_reward, False
 
+        invalid = False
         if action <= 0 or action > self.cache_size:
             if self.invalid_penalty:
                 reward = -1.0
             slot_idx = random.randrange(self.cache_size)
+            invalid = True
         else:
             slot_idx = action - 1
+        self._update_stats(req_id)
         self._evict_into(slot_idx, req_id)
         self._update_global(False)
+        self.last_step_info = {
+            "hit": False, "miss": True, "admit": True, "bypass": False, "insert": False, "evict": True,
+            "invalid": invalid, "evicted_slot": slot_idx
+        }
         return reward, False
 
 
@@ -409,7 +420,10 @@ def rollout_episode(model, req_stream: List[int], start: int, length: int, cache
     hidden = model.init_hidden(1)
     model.eval()
     obs_list, ar_list = [], []
-    stats = {"total_reward": 0.0, "hit_count": 0, "miss_count": 0, "bypass_count": 0, "insert_count": 0, "eviction_count": 0}
+    stats = {
+        "total_reward": 0.0, "hit_count": 0, "miss_count": 0, "bypass_count": 0, "insert_count": 0, "eviction_count": 0,
+        "admit_count": 0, "reject_count": 0
+    }
     end = min(start + length, len(req_stream))
     T = end - start
     if T < 2:
@@ -419,20 +433,23 @@ def rollout_episode(model, req_stream: List[int], start: int, length: int, cache
         obs = Obs(env.get_cache_features(), env.get_global_features(), env.get_request_features(req), env.valid_action_mask(req))
         obs_list.append(obs)
         a, hidden = select_action(model, obs, hidden, eps, device)
-        had_empty, was_hit = env._has_empty(), env._has_item(req)
         r, hit = env.step(req, a)
         stats["total_reward"] += float(r)
-        if hit:
+        step_info = env.last_step_info
+        if step_info.get("hit", hit):
             stats["hit_count"] += 1
         else:
             stats["miss_count"] += 1
-            if not was_hit and had_empty:
+            if step_info.get("admit", False):
+                stats["admit_count"] += 1
+            else:
+                stats["reject_count"] += 1
+            if step_info.get("insert", False):
                 stats["insert_count"] += 1
-            elif not was_hit and not had_empty:
-                if a == 0 and env.use_tinylfu_admission:
-                    stats["bypass_count"] += 1
-                else:
-                    stats["eviction_count"] += 1
+            elif step_info.get("bypass", False):
+                stats["bypass_count"] += 1
+            elif step_info.get("evict", False):
+                stats["eviction_count"] += 1
         ar_list.append(AR(action=a, reward=float(r), done=(i == T - 1)))
     last_req = req_stream[end - 1]
     obs_list.append(Obs(env.get_cache_features(), env.get_global_features(), env.get_request_features(last_req), env.valid_action_mask(last_req)))
