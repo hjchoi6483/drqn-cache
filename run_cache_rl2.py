@@ -134,7 +134,7 @@ CONFIG = {
     "SCENARIOS": ["zipf"],
 
     # paper-grade baseline set for reporting/comparison
-    "BASELINES": ["lru", "lfu", "lruk", "2q", "arc", "tinylfu", "wtinylfu", "belady"],
+    "BASELINES": ["lru", "lfu", "lruk", "2q", "arc", "tinylfu", "belady"],
 
 
     # training

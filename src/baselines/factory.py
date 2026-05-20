@@ -9,7 +9,6 @@ from .lru import LRUCacheSim
 from .lruk import LRUKCacheSim
 from .tinylfu import TinyLFUCacheSim
 from .twoq import TwoQCacheSim
-from .wtinylfu import WTinyLFUCacheSim
 
 
 def build_baselines(names: Iterable[str], capacity: int, trace: List[int] | None = None) -> Dict[str, object]:
@@ -32,9 +31,6 @@ def build_baselines(names: Iterable[str], capacity: int, trace: List[int] | None
             continue
         if name == "tinylfu":
             out[name] = TinyLFUCacheSim(capacity)
-            continue
-        if name == "wtinylfu":
-            out[name] = WTinyLFUCacheSim(capacity)
             continue
         if name == "belady":
             out[name] = BeladyCacheSim(capacity, trace=trace)

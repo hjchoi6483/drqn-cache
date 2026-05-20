@@ -22,7 +22,7 @@ def run_trace(baseline, trace):
 def main():
     trace = [1, 2, 3, 1, 2, 4, 1, 2, 3, 4]
     capacity = 2
-    names = ["lru", "lfu", "lruk", "2q", "arc", "tinylfu", "wtinylfu", "belady"]
+    names = ["lru", "lfu", "lruk", "2q", "arc", "tinylfu", "belady"]
 
     baselines = build_baselines(names, capacity, trace=trace)
     results = {}
@@ -31,10 +31,27 @@ def main():
 
     assert results["belady"]["hit_rate"] >= results["lru"]["hit_rate"]
 
+    tiny = baselines["tinylfu"]
+    tstats = tiny.stats()
+    assert int(tstats["hits"] + tstats["misses"]) == len(trace)
+    assert math.isfinite(float(tstats["hit_rate"]))
+    assert len(tiny.cache) <= capacity
+
+    keep_trace = [1] * 20 + list(range(100, 130)) + [1] * 20
+    tiny2 = build_baselines(["tinylfu"], capacity=3, trace=keep_trace)["tinylfu"]
+    for req in keep_trace:
+        tiny2.access(req)
+    assert 1 in tiny2.cache
+
     for name in names:
         baselines[name].reset(capacity)
-        assert baselines[name].stats()["hits"] == 0.0
-        assert baselines[name].stats()["misses"] == 0.0
+        st = baselines[name].stats()
+        assert st["hits"] == 0.0
+        assert st["misses"] == 0.0
+
+    ts2 = baselines["tinylfu"].stats()
+    assert ts2["admissions"] == 0.0
+    assert ts2["bypasses"] == 0.0
 
     print("smoke_baselines: ok")
 
