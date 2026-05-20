@@ -230,7 +230,7 @@ if ARGS.use_quick_preset:
 # =========================
 @dataclass(frozen=True)
 class Setting:
-    # algo: "drqn_perslot", "pooling_lstm"
+    # algo: "drqn_perslot"
     algo: str
     use_global: bool
     invalid_penalty: bool
@@ -240,7 +240,6 @@ def setting_name(s: Setting) -> str:
 
 SETTINGS: List[Setting] = [
     Setting("drqn_perslot", True, False),
-    Setting("pooling_lstm", True, True),
 ]
 
 
