@@ -133,10 +133,7 @@ CONFIG = {
     "CACHE_SIZES": [16, 64],
     "SCENARIOS": ["zipf"],
 
-    # baseline lists
-    # - OPTUNA_BASELINES: light baselines during hyperparameter search
-    # - BASELINES: paper-grade set for final reported comparisons
-    "OPTUNA_BASELINES": ["lru", "arc"],
+    # paper-grade baseline set for reporting/comparison
     "BASELINES": ["lru", "lfu", "lruk", "2q", "arc", "tinylfu", "wtinylfu", "belady"],
 
 
@@ -479,8 +476,7 @@ def train_one_run(
 
             eval_rec = {}
             if ep % int(CONFIG["FAST_EVAL_EVERY_EP"]) == 0:
-                eval_baselines = list(CONFIG["OPTUNA_BASELINES"]) if trial is not None else list(CONFIG["BASELINES"])
-                res = eval_policy(online, scenario, alpha, test_fast, cache_size, s, eval_kind="fast", baseline_names=eval_baselines)
+                res = eval_policy(online, scenario, alpha, test_fast, cache_size, s, eval_kind="fast")
                 eval_rec.update({f"fast_{k}": v for k, v in res.items()})
                 if trial is not None:
                     trial.report(hit_proxy, ep)
@@ -488,8 +484,7 @@ def train_one_run(
                         raise TrialPruned(f"Pruned at ep={ep}, hit_proxy={hit_proxy:.4f}")
 
             if ep % int(CONFIG["FULL_EVAL_EVERY_EP"]) == 0:
-                eval_baselines = list(CONFIG["OPTUNA_BASELINES"]) if trial is not None else list(CONFIG["BASELINES"])
-                res = eval_policy(online, scenario, alpha, test_full, cache_size, s, eval_kind="full", baseline_names=eval_baselines)
+                res = eval_policy(online, scenario, alpha, test_full, cache_size, s, eval_kind="full")
                 eval_rec.update({f"full_{k}": v for k, v in res.items()})
 
 
@@ -541,8 +536,7 @@ def train_one_run(
         return None
 
     # final eval: full
-    final_baselines = list(CONFIG["OPTUNA_BASELINES"]) if trial is not None else list(CONFIG["BASELINES"])
-    final = eval_policy(online, scenario, alpha, test_full, cache_size, s, eval_kind="full", baseline_names=final_baselines)
+    final = eval_policy(online, scenario, alpha, test_full, cache_size, s, eval_kind="full")
 
     row = {
         "run_id": rid,
@@ -563,7 +557,7 @@ def train_one_run(
         "wall_sec": float(time.time() - t0),
     }
 
-    for name in final_baselines:
+    for name in CONFIG["BASELINES"]:
         row[f"baseline_hit_{name}"] = float(final.get(f"baseline_hit_{name}", 0.0))
         row[f"rl_minus_baseline_{name}"] = float(final.get(f"rl_minus_baseline_{name}", 0.0))
     if persist_result:
@@ -572,7 +566,7 @@ def train_one_run(
     if CONFIG["SAVE_CKPT"]:
         save_ckpt(rid, online, target, optimizer, replay, st)
 
-    baseline_msg = ' '.join([f"{str(name).upper()} {row.get('baseline_hit_' + str(name), 0.0):.2f}" for name in final_baselines])
+    baseline_msg = ' '.join([f"{str(name).upper()} {row.get('baseline_hit_' + str(name), 0.0):.2f}" for name in CONFIG['BASELINES']])
     print(f"\n[DONE] {rid} | RL {row['rl_hit']:.2f}  {baseline_msg}", flush=True)
     return row
 
@@ -725,7 +719,7 @@ def run_all():
     # Step 0: stream cache 생성(재사용)
     stream_cache = build_stream_cache()
 
-    print(f"[BASELINES] optuna={CONFIG['OPTUNA_BASELINES']} | full={CONFIG['BASELINES']}")
+    print(f"[BASELINES] {CONFIG['BASELINES']}")
 
     # Step 1: Optuna 최적화(딱 1회)
     best_params = optimize_hparams(stream_cache)
