@@ -1,9 +1,17 @@
 from __future__ import annotations
 
+import hashlib
 from typing import Callable, Dict, List, Tuple
 
 
-BaselineKey = Tuple[str, float, int, str, Tuple[str, ...]]
+BaselineKey = Tuple[str, float, int, str, Tuple[str, ...], int, str]
+
+
+def _trace_fingerprint(test_stream: List[int]) -> str:
+    h = hashlib.sha1()
+    for req in test_stream:
+        h.update(int(req).to_bytes(8, byteorder="little", signed=True))
+    return h.hexdigest()
 
 
 def compute_baselines_once(
@@ -14,14 +22,23 @@ def compute_baselines_once(
     test_stream: List[int],
     baseline_names: List[str],
     baseline_cache: Dict[BaselineKey, Dict[str, float]],
-    build_baselines_fn: Callable[[List[str], int], Dict[str, object]],
+    build_baselines_fn: Callable[..., Dict[str, object]],
 ) -> Dict[str, float]:
     names_key = tuple(sorted(baseline_names))
-    key: BaselineKey = (scenario, float(alpha), int(cache_size), str(eval_kind), names_key)
+    trace_fp = _trace_fingerprint(test_stream)
+    key: BaselineKey = (
+        scenario,
+        float(alpha),
+        int(cache_size),
+        str(eval_kind),
+        names_key,
+        len(test_stream),
+        trace_fp,
+    )
     if key in baseline_cache:
         return baseline_cache[key]
 
-    baselines = build_baselines_fn(baseline_names, cache_size)
+    baselines = build_baselines_fn(baseline_names, cache_size, trace=test_stream)
     for req in test_stream:
         for baseline in baselines.values():
             baseline.access(req)
@@ -44,7 +61,7 @@ def evaluate_policy_with_baselines(
     eval_kind: str,
     baseline_names: List[str],
     baseline_cache: Dict[BaselineKey, Dict[str, float]],
-    build_baselines_fn: Callable[[List[str], int], Dict[str, object]],
+    build_baselines_fn: Callable[..., Dict[str, object]],
     make_env_fn,
     make_obs_fn,
     select_action_fn,

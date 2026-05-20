@@ -305,45 +305,13 @@ class DRQN_PerSlot(nn.Module):
         return q, hidden
 
 
-class PoolingQNet(nn.Module):
-    def __init__(self, cache_size: int, use_global: bool, device: torch.device):
-        super().__init__()
-        self.cache_size = cache_size
-        self.use_global = use_global
-        self.device = device
-        self.slot_proj = nn.Sequential(nn.Linear(META_DIM, CACHE_KEY_DIM), nn.ReLU(), nn.Linear(CACHE_KEY_DIM, CACHE_KEY_DIM), nn.ReLU())
-        self.req_proj = nn.Sequential(nn.Linear(REQ_DIM, REQ_EMB_DIM), nn.ReLU(), nn.Linear(REQ_EMB_DIM, REQ_EMB_DIM), nn.ReLU())
-        in_dim = 3 * CACHE_KEY_DIM + REQ_EMB_DIM + (GLOBAL_DIM if use_global else 0)
-        self.in_proj = nn.Sequential(nn.Linear(in_dim, LSTM_INPUT_DIM), nn.ReLU())
-        self.lstm = nn.LSTM(LSTM_INPUT_DIM, HIDDEN_DIM, batch_first=True)
-        self.out = nn.Sequential(nn.Linear(HIDDEN_DIM, 128), nn.ReLU(), nn.Linear(128, cache_size + 1))
-
-    def init_hidden(self, B: int):
-        h = torch.zeros(1, B, HIDDEN_DIM, device=self.device)
-        c = torch.zeros(1, B, HIDDEN_DIM, device=self.device)
-        return (h, c)
-
-    def forward_step(self, cache_feat: torch.Tensor, global_feat: torch.Tensor, req_feat: torch.Tensor, hidden):
-        slot_emb = self.slot_proj(cache_feat)
-        pooled = pool_meanmaxmin(slot_emb)
-        req_emb = self.req_proj(req_feat)
-        x = torch.cat([pooled, req_emb], dim=1)
-        if self.use_global:
-            x = torch.cat([x, global_feat], dim=1)
-        x = self.in_proj(x).unsqueeze(1)
-        out, hidden = self.lstm(x, hidden)
-        return self.out(out[:, -1, :]), hidden
 
 
 def build_models(cache_size: int, s, device: torch.device):
-    if s.algo == "drqn_perslot":
-        online = DRQN_PerSlot(cache_size, s.use_global, device).to(device)
-        target = DRQN_PerSlot(cache_size, s.use_global, device).to(device)
-    elif s.algo == "pooling_lstm":
-        online = PoolingQNet(cache_size, s.use_global, device=device).to(device)
-        target = PoolingQNet(cache_size, s.use_global, device=device).to(device)
-    else:
+    if s.algo != "drqn_perslot":
         raise ValueError(s.algo)
+    online = DRQN_PerSlot(cache_size, s.use_global, device).to(device)
+    target = DRQN_PerSlot(cache_size, s.use_global, device).to(device)
     target.load_state_dict(online.state_dict())
     return online, target
 

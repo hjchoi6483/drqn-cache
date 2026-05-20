@@ -133,8 +133,8 @@ CONFIG = {
     "CACHE_SIZES": [16, 64],
     "SCENARIOS": ["zipf"],
 
-    # baseline list (Step A multi-baseline-ready schema)
-    "BASELINES": ["lru", "arc"],
+    # paper-grade baseline set for reporting/comparison
+    "BASELINES": ["lru", "lfu", "lruk", "2q", "arc", "tinylfu", "belady"],
 
 
     # training
@@ -230,7 +230,7 @@ if ARGS.use_quick_preset:
 # =========================
 @dataclass(frozen=True)
 class Setting:
-    # algo: "drqn_perslot", "pooling_lstm"
+    # algo: "drqn_perslot"
     algo: str
     use_global: bool
     invalid_penalty: bool
@@ -240,7 +240,6 @@ def setting_name(s: Setting) -> str:
 
 SETTINGS: List[Setting] = [
     Setting("drqn_perslot", True, False),
-    Setting("pooling_lstm", True, True),
 ]
 
 
@@ -325,8 +324,10 @@ def eval_policy(
     cache_size: int,
     s: Setting,
     eval_kind: str,
+    baseline_names: List[str] | None = None,
 ) -> Dict[str, float]:
-    baseline_names = list(CONFIG["BASELINES"])
+    if baseline_names is None:
+        baseline_names = list(CONFIG["BASELINES"])
     return evaluate_policy_with_baselines(
         model=model,
         scenario=scenario,
@@ -716,6 +717,8 @@ def run_all():
 
     # Step 0: stream cache 생성(재사용)
     stream_cache = build_stream_cache()
+
+    print(f"[BASELINES] {CONFIG['BASELINES']}")
 
     # Step 1: Optuna 최적화(딱 1회)
     best_params = optimize_hparams(stream_cache)
