@@ -134,7 +134,8 @@ CONFIG = {
     "SCENARIOS": ["zipf"],
 
     # baseline list (Step A multi-baseline-ready schema)
-    "BASELINES": ["lru", "arc"],
+    "BASELINES": ["lru", "lfu", "lruk", "2q", "arc", "tinylfu", "wtinylfu", "belady"],
+    # quick baseline set example: ["lru", "arc"]
 
 
     # training

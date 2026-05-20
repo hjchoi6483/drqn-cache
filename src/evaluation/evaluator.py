@@ -14,14 +14,14 @@ def compute_baselines_once(
     test_stream: List[int],
     baseline_names: List[str],
     baseline_cache: Dict[BaselineKey, Dict[str, float]],
-    build_baselines_fn: Callable[[List[str], int], Dict[str, object]],
+    build_baselines_fn: Callable[..., Dict[str, object]],
 ) -> Dict[str, float]:
     names_key = tuple(sorted(baseline_names))
     key: BaselineKey = (scenario, float(alpha), int(cache_size), str(eval_kind), names_key)
     if key in baseline_cache:
         return baseline_cache[key]
 
-    baselines = build_baselines_fn(baseline_names, cache_size)
+    baselines = build_baselines_fn(baseline_names, cache_size, trace=test_stream)
     for req in test_stream:
         for baseline in baselines.values():
             baseline.access(req)
@@ -44,7 +44,7 @@ def evaluate_policy_with_baselines(
     eval_kind: str,
     baseline_names: List[str],
     baseline_cache: Dict[BaselineKey, Dict[str, float]],
-    build_baselines_fn: Callable[[List[str], int], Dict[str, object]],
+    build_baselines_fn: Callable[..., Dict[str, object]],
     make_env_fn,
     make_obs_fn,
     select_action_fn,
