@@ -1,15 +1,16 @@
 # drqn-cache
 
-DRQN 기반 캐시 교체 정책을 학습하고, 고전 알고리즘(LRU/ARC)과 동일한 요청 트레이스에서 비교 평가하는 실험 러너입니다.
+DRQN 기반 캐시 교체 정책을 학습하고, 고전 알고리즘들과 동일한 요청 트레이스에서 비교 평가하는 실험 러너입니다.
 
 ## 핵심 특징
 
 - **RL 모델 2종 비교**
   - `drqn_perslot|G1|P0`
   - `pooling_lstm|G1|P1`
-- **베이스라인 2종 내장**
-  - `lru`
-  - `arc`
+- **베이스라인 세트 선택**
+  - `minimal`: `lru`, `arc`
+  - `diverse`: `lru`, `lfu`, `lruk`, `2q`, `arc`, `tinylfu`, `belady`
+  - `paper`: `lru`, `lfu`, `lruk`, `2q`, `arc`, `tinylfu`, `wtinylfu`, `belady`
 - **Optuna 하이퍼파라미터 탐색**
   - 단일 환경 과적합을 피하기 위해 4개 대표 시나리오 평균 점수 사용
 - **결과 자동 저장**
@@ -55,13 +56,19 @@ pip install -r requirements-colab.txt
 ### 1) Quick preset
 
 ```bash
-python run_cache_rl2.py --out_dir out_quick --device cpu --use_quick_preset --optuna_trials 30
+python run_cache_rl2.py --out_dir out_quick --device cpu --preset quick --optuna_trials 30
 ```
 
-### 2) Full run
+### 2) Paper-opt preset
 
 ```bash
-python run_cache_rl2.py --out_dir out_full --device cpu --optuna_trials 40
+python run_cache_rl2.py --out_dir out_paper --device cpu --preset paper_opt --optuna_trials 40
+```
+
+### 3) Full run
+
+```bash
+python run_cache_rl2.py --out_dir out_full --device cpu --preset full --optuna_trials 40
 ```
 
 > GPU 사용 시 `--device cuda` 또는 `--device cuda:0` 지정.
@@ -79,37 +86,53 @@ python run_cache_rl2.py --out_dir out_full --device cpu --optuna_trials 40
 - seed: `[0]`
 - 학습 에피소드: 최대 `400`
 
-Quick preset(`--use_quick_preset`) 적용 시:
+Quick preset(`--preset quick`, legacy `--use_quick_preset`) 적용 시:
 
 - 요청 수: `250,000`
 - seed: `[0, 1]`
 - 학습/평가 스텝 축소 (빠른 smoke + 트렌드 확인용)
 
+Paper-opt preset(`--preset paper_opt`) 적용 시:
+
+- 요청 수: `500,000`
+- seed: `[0, 1, 2, 3, 4]`
+- 학습/평가를 full보다 가볍게 유지하면서 quick보다 안정적인 비교용 설정
+
 ---
 
 ## Optuna objective 설계
 
-각 trial에서 아래 4개 조합을 짧게 학습/평가하고, `rl_hit` 평균을 objective로 사용합니다.
+튜닝 프로파일(`--tuning_profile`)에 따라 대표 그리드를 다르게 사용합니다.
 
-- `(zipf, 1.3, 16)`
-- `(zipf, 1.3, 64)`
-- `(zipf, 1.8, 16)`
-- `(zipf, 1.8, 64)`
+- `quick`: alpha `[1.3, 1.8]`, cache `[16, 64]`, seed 1개
+- `paper`: alpha `[1.3, 1.5, 1.8]`, cache `[16, 64]`, seed 1개
+- `robust`: alpha `[1.3, 1.5, 1.8]`, cache `[16, 64]`, seed 최대 2개
+
+objective는 `0.8 * mean(scores) + 0.2 * min(scores)`를 사용해 평균 성능과 hard case 안정성을 함께 반영합니다.
 
 탐색 파라미터:
 
-- `LR`: `1e-5 ~ 1e-3` (log)
-- `GAMMA`: `0.9 ~ 0.999`
-- `UNROLL`: `20 ~ 80` (step=10)
+- `LR`: `3e-5 ~ 8e-4` (log)
+- `GAMMA`: `0.92 ~ 0.995`
+- `UNROLL`: `[30, 40, 60, 80]`
 - `BATCH_SIZE`: `[16, 32, 64]`
+- `TARGET_UPDATE_EVERY_UPDATES`: `[200, 500, 1000]`
+- `UPDATES_PER_EPISODE`: `[8, 12, 16]`
+- `EPSILON_DECAY_STEPS`: `[100000, 200000, 300000]`
 
 ---
 
 ## 출력 파일
 
 - `OUT_DIR/best_params.json`: Optuna 최고 파라미터
+- `OUT_DIR/experiment_config.json`: 실행 메타데이터/최종 CONFIG/CLI 인자/깃 정보
 - `OUT_DIR/results.csv`: run-level 결과
 - `OUT_DIR/summary.csv`: 그룹 집계 결과
+- `OUT_DIR/summary_overall.csv`
+- `OUT_DIR/summary_by_cache.csv`
+- `OUT_DIR/summary_by_alpha.csv`
+- `OUT_DIR/summary_hard_conditions.csv`
+- `OUT_DIR/summary_belady_gap.csv`
 - `OUT_DIR/logs/*.jsonl`: 에피소드 로그
 - `OUT_DIR/ckpt/*.pt`: 모델 체크포인트
 
@@ -127,4 +150,3 @@ Quick preset(`--use_quick_preset`) 적용 시:
    - CUDA 요청 시 사용 가능 여부/인덱스 유효성 검사
 4. **행동 제약 일관성**
    - `valid_action_mask`로 hit/empty 상태에서 `NOOP`만 유효하게 처리
-
