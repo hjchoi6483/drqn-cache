@@ -21,13 +21,14 @@
 from __future__ import annotations
 
 import os
+import subprocess
 import json
 import csv
 import time
 import random
 import argparse
 from dataclasses import dataclass, asdict
-from typing import List, Tuple, Dict
+from typing import List, Tuple, Dict, Any
 
 import numpy as np
 import optuna
@@ -72,6 +73,17 @@ def parse_args():
     p.add_argument("--out_dir", type=str, default="out", help="결과 저장 폴더 (기본: ./out)")
     p.add_argument("--device", type=str, default="cuda", help="cpu | cuda | cuda:0 등 (기본: cuda)")
     p.add_argument("--use_quick_preset", action="store_true", help="빠른 실험용 축소 프리셋 적용")
+    p.add_argument("--preset", type=str, choices=["quick", "paper_opt", "full"], default="full")
+    p.add_argument("--skip_optuna", action="store_true")
+    p.add_argument("--best_params_path", type=str, default=None)
+    p.add_argument("--tuning_profile", type=str, choices=["quick", "paper", "robust"], default="paper")
+    p.add_argument("--only_algo", type=str, default=None)
+    p.add_argument("--only_alpha", type=str, default=None)
+    p.add_argument("--only_cache", type=str, default=None)
+    p.add_argument("--seeds", type=str, default=None)
+    p.add_argument("--baseline_set", type=str, choices=["minimal", "diverse", "paper"], default="paper")
+    p.add_argument("--study_name", type=str, default=None)
+    p.add_argument("--optuna_storage", type=str, default=None)
     p.add_argument("--optuna_trials", type=int, default=40, help="Optuna trial 횟수 (기본: 40)")
     return p.parse_args()
 
@@ -134,7 +146,7 @@ CONFIG = {
     "SCENARIOS": ["zipf"],
 
     # paper-grade baseline set for reporting/comparison
-    "BASELINES": ["lru", "lfu", "lruk", "2q", "arc", "tinylfu", "belady"],
+    "BASELINES": ["lru", "lfu", "lruk", "2q", "arc", "tinylfu", "wtinylfu", "belady"],
 
 
     # training
@@ -220,9 +232,26 @@ def apply_quick_preset():
         "FULL_EVAL_STEPS": 20_000,
     })
 
-if ARGS.use_quick_preset:
-    apply_quick_preset()
-    print("[CONFIG] Quick preset enabled.")
+def apply_paper_opt_preset():
+    CONFIG.update({
+        "EXPERIMENT_TAG": "paper_opt",
+        "NUM_REQUESTS": 500_000,
+        "TRAIN_RATIO": 0.8,
+        "ZIPF_ALPHAS": [1.3, 1.4, 1.5, 1.6, 1.7, 1.8],
+        "CACHE_SIZES": [16, 64],
+        "SEEDS": [0, 1, 2, 3, 4],
+        "EPISODE_LEN": 2500,
+        "MAX_TRAIN_EPISODES": 160,
+        "REPLAY_MAX_EPISODES": 500,
+        "START_TRAIN_AFTER_EPISODES": 10,
+        "UPDATES_PER_EPISODE": 12,
+        "FAST_EVAL_EVERY_EP": 40,
+        "FAST_EVAL_STEPS": 10_000,
+        "FULL_EVAL_EVERY_EP": 80,
+        "FULL_EVAL_STEPS": 100_000,
+        "SAVE_CKPT": True,
+        "SAVE_CKPT_EVERY_EP": 5,
+    })
 
 
 # =========================
@@ -241,6 +270,62 @@ def setting_name(s: Setting) -> str:
 SETTINGS: List[Setting] = [
     Setting("drqn_perslot", True, False),
 ]
+
+
+def _parse_csv_numbers(raw: str, cast, label: str) -> List[Any]:
+    vals: List[Any] = []
+    for tok in raw.split(","):
+        tok = tok.strip()
+        if not tok:
+            continue
+        try:
+            vals.append(cast(tok))
+        except ValueError as e:
+            raise ValueError(f"Invalid {label} value '{tok}'.") from e
+    if not vals:
+        raise ValueError(f"{label} cannot be empty.")
+    return vals
+
+
+def apply_baseline_set(name: str):
+    baseline_sets = {
+        "minimal": ["lru", "arc"],
+        "diverse": ["lru", "lfu", "lruk", "2q", "arc", "tinylfu", "belady"],
+        "paper": ["lru", "lfu", "lruk", "2q", "arc", "tinylfu", "wtinylfu", "belady"],
+    }
+    CONFIG["BASELINES"] = list(baseline_sets[name])
+
+
+def apply_cli_overrides():
+    selected_preset = ARGS.preset
+    if ARGS.use_quick_preset:
+        if ARGS.preset != "quick":
+            print("[WARN] --use_quick_preset overrides --preset. Using quick preset.")
+        selected_preset = "quick"
+    if selected_preset == "quick":
+        apply_quick_preset()
+    elif selected_preset == "paper_opt":
+        apply_paper_opt_preset()
+    else:
+        CONFIG["EXPERIMENT_TAG"] = "full"
+
+    apply_baseline_set(ARGS.baseline_set)
+
+    if ARGS.only_alpha is not None:
+        CONFIG["ZIPF_ALPHAS"] = _parse_csv_numbers(ARGS.only_alpha, float, "alpha")
+    if ARGS.only_cache is not None:
+        CONFIG["CACHE_SIZES"] = _parse_csv_numbers(ARGS.only_cache, int, "cache_size")
+    if ARGS.seeds is not None:
+        CONFIG["SEEDS"] = _parse_csv_numbers(ARGS.seeds, int, "seed")
+
+    global SETTINGS
+    if ARGS.only_algo is not None:
+        SETTINGS = [s for s in SETTINGS if s.algo == ARGS.only_algo]
+        if not SETTINGS:
+            raise ValueError(f"No SETTINGS matched --only_algo={ARGS.only_algo}")
+
+
+apply_cli_overrides()
 
 
 # =========================
@@ -285,6 +370,8 @@ def results_csv_path() -> str:
 
 def summary_csv_path() -> str:
     return os.path.join(CONFIG["OUT_DIR"], "summary.csv")
+def experiment_config_path() -> str:
+    return os.path.join(CONFIG["OUT_DIR"], "experiment_config.json")
 
 def write_row_csv(path: str, row: dict):
     exists = os.path.exists(path)
@@ -477,10 +564,10 @@ def train_one_run(
             if ep % int(CONFIG["FAST_EVAL_EVERY_EP"]) == 0:
                 res = eval_policy(online, scenario, alpha, test_fast, cache_size, s, eval_kind="fast")
                 eval_rec.update({f"fast_{k}": v for k, v in res.items()})
-                if trial is not None:
-                    trial.report(hit_proxy, ep)
+                if trial is not None and "fast_rl_hit" in eval_rec:
+                    trial.report(float(eval_rec["fast_rl_hit"]), ep)
                     if trial.should_prune():
-                        raise TrialPruned(f"Pruned at ep={ep}, hit_proxy={hit_proxy:.4f}")
+                        raise TrialPruned(f"Pruned at ep={ep}, fast_rl_hit={float(eval_rec['fast_rl_hit']):.4f}")
 
             if ep % int(CONFIG["FULL_EVAL_EVERY_EP"]) == 0:
                 res = eval_policy(online, scenario, alpha, test_full, cache_size, s, eval_kind="full")
@@ -586,25 +673,38 @@ def build_stream_cache() -> Dict[Tuple[str, float, int], Dict[str, List[int]]]:
     return stream_cache
 
 
+def representative_grid(profile: str) -> List[Tuple[str, float, int, int]]:
+    alphas = [1.3, 1.8] if profile == "quick" else [1.3, 1.5, 1.8]
+    caches = [16, 64]
+    seeds = CONFIG["SEEDS"][:1] if profile in {"quick", "paper"} else (CONFIG["SEEDS"][:2] if len(CONFIG["SEEDS"]) >= 2 else CONFIG["SEEDS"][:1])
+    out = []
+    for a in alphas:
+        for c in caches:
+            for seed in seeds:
+                out.append(("zipf", float(a), int(c), int(seed)))
+    return out
+
+
 def objective(trial: optuna.trial.Trial, stream_cache: Dict[Tuple[str, float, int], Dict[str, List[int]]]) -> float:
-    CONFIG["LR"] = trial.suggest_float("LR", 1e-5, 1e-3, log=True)
-    CONFIG["GAMMA"] = trial.suggest_float("GAMMA", 0.9, 0.999)
-    CONFIG["UNROLL"] = trial.suggest_int("UNROLL", 20, 80, step=10)
+    CONFIG["LR"] = trial.suggest_float("LR", 3e-5, 8e-4, log=True)
+    CONFIG["GAMMA"] = trial.suggest_float("GAMMA", 0.92, 0.995)
+    CONFIG["UNROLL"] = trial.suggest_categorical("UNROLL", [30, 40, 60, 80])
     CONFIG["BATCH_SIZE"] = trial.suggest_categorical("BATCH_SIZE", [16, 32, 64])
+    CONFIG["TARGET_UPDATE_EVERY_UPDATES"] = trial.suggest_categorical("TARGET_UPDATE_EVERY_UPDATES", [200, 500, 1000])
+    CONFIG["UPDATES_PER_EPISODE"] = trial.suggest_categorical("UPDATES_PER_EPISODE", [8, 12, 16])
+    CONFIG["EPSILON_DECAY_STEPS"] = trial.suggest_categorical("EPSILON_DECAY_STEPS", [100_000, 200_000, 300_000])
+    if CONFIG["USE_TWO_STAGE_TINYLFU"]:
+        CONFIG["RECENT_WINDOW_SIZE"] = trial.suggest_categorical("RECENT_WINDOW_SIZE", [500, 1000, 5000])
+        CONFIG["TINYLFU_MIN_ADMIT_COUNT"] = trial.suggest_categorical("TINYLFU_MIN_ADMIT_COUNT", [1, 2, 3])
+        CONFIG["RECENT_FREQ_DENOM"] = trial.suggest_categorical("RECENT_FREQ_DENOM", [10.0, 20.0, 50.0])
 
-    scenario_grid = [
-        ("zipf", 1.3, 16),
-        ("zipf", 1.3, 64),
-        ("zipf", 1.8, 16),
-        ("zipf", 1.8, 64),
-    ]
-
-    seed = int(CONFIG["SEEDS"][0])
+    scenario_grid = representative_grid(ARGS.tuning_profile)
     setting = SETTINGS[0]
     scores: List[float] = []
+    scenario_scores: List[Dict[str, Any]] = []
 
-    for idx, (scenario, alpha, cache_size) in enumerate(scenario_grid):
-        gk = (scenario, float(alpha), seed)
+    for idx, (scenario, alpha, cache_size, seed) in enumerate(scenario_grid):
+        gk = (scenario, float(alpha), int(seed))
         streams = stream_cache[gk]
         row = train_one_run(
             scenario=scenario,
@@ -621,21 +721,40 @@ def objective(trial: optuna.trial.Trial, stream_cache: Dict[Tuple[str, float, in
         )
         if row is None:
             return 0.0
-        scores.append(float(row["rl_hit"]))
+        score = float(row["rl_hit"])
+        scores.append(score)
+        scenario_scores.append({"scenario": scenario, "alpha": alpha, "cache_size": cache_size, "seed": seed, "score": score})
         trial.report(float(np.mean(scores)), idx + 1)
         if trial.should_prune():
             raise TrialPruned(f"Pruned at scenario #{idx + 1} with mean={np.mean(scores):.4f}")
 
-    return float(np.mean(scores)) if scores else 0.0
+    if not scores:
+        return 0.0
+    mean_score = float(np.mean(scores))
+    min_score = float(np.min(scores))
+    std_score = float(np.std(scores, ddof=1)) if len(scores) > 1 else 0.0
+    hard_scores = [x["score"] for x in scenario_scores if x["alpha"] == 1.3 and x["cache_size"] == 16]
+    hard_score = float(np.mean(hard_scores)) if hard_scores else min_score
+    objective_score = 0.8 * mean_score + 0.2 * min_score
+    trial.set_user_attr("mean_score", mean_score)
+    trial.set_user_attr("min_score", min_score)
+    trial.set_user_attr("std_score", std_score)
+    trial.set_user_attr("hard_score", hard_score)
+    trial.set_user_attr("scenario_scores", scenario_scores)
+    return float(objective_score)
 
 
 def optimize_hparams(stream_cache: Dict[Tuple[str, float, int], Dict[str, List[int]]]) -> Dict[str, float]:
     print("\n[OPTUNA] Starting hyperparameter optimization...")
+    algo_name = SETTINGS[0].algo if SETTINGS else "none"
+    twostage = "twostage" if CONFIG.get("USE_TWO_STAGE_TINYLFU", False) else "nostage"
+    default_study_name = f"{CONFIG['EXPERIMENT_TAG']}_{ARGS.tuning_profile}_{algo_name}_{twostage}"
+    storage = ARGS.optuna_storage or f"sqlite:///{CONFIG['OUT_DIR']}/optuna_{CONFIG['EXPERIMENT_TAG']}_{ARGS.tuning_profile}.db"
     study = optuna.create_study(
         direction="maximize",
         pruner=optuna.pruners.MedianPruner(),
-        storage="sqlite:///optuna_study.db",
-        study_name="drqn_cache_tuning",
+        storage=storage,
+        study_name=ARGS.study_name or default_study_name,
         load_if_exists=True,
     )
     study.optimize(lambda trial: objective(trial, stream_cache), n_trials=int(ARGS.optuna_trials))
@@ -644,6 +763,14 @@ def optimize_hparams(stream_cache: Dict[Tuple[str, float, int], Dict[str, List[i
         json.dump(best_params, f, ensure_ascii=False, indent=2)
     print(f"[OPTUNA] Best params: {best_params}")
     return best_params
+
+
+def load_best_params(path: str) -> Dict[str, object]:
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    if not isinstance(data, dict):
+        raise ValueError(f"best_params JSON must be object: {path}")
+    return data
 
 
 # =========================
@@ -701,12 +828,69 @@ def build_summary():
 
         out.append(row_out)
 
-    if out:
-        with open(summary_csv_path(), "w", newline="", encoding="utf-8") as f:
-            w = csv.DictWriter(f, fieldnames=list(out[0].keys()))
+    if not out:
+        return
+    with open(summary_csv_path(), "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=list(out[0].keys()))
+        w.writeheader()
+        for row in out:
+            w.writerow(row)
+
+    def write_grouped(path: str, grouped_rows: Dict[Tuple[Any, ...], List[dict]], keys: List[str]):
+        rows_out = []
+        for k, rs in grouped_rows.items():
+            rr = {kk: kv for kk, kv in zip(keys, k)}
+            rl = [float(x["rl_hit"]) for x in rs]
+            rr["n"] = len(rs)
+            rr["rl_mean"], rr["rl_std"] = mean_std(rl)
+            rr["rl_min"], rr["rl_max"] = float(np.min(rl)), float(np.max(rl))
+            rr["wall_sec_mean"] = float(np.mean([float(x["wall_sec"]) for x in rs]))
+            rr["final_loss_tail_mean_mean"] = float(np.mean([float(x["final_loss_tail_mean"]) for x in rs]))
+            for b in CONFIG["BASELINES"]:
+                bcol = f"baseline_hit_{b}"
+                dcol = f"rl_minus_baseline_{b}"
+                bvals = [float(x.get(bcol, 0.0)) for x in rs]
+                dvals = [float(x.get(dcol, 0.0)) for x in rs]
+                rr[f"{b}_mean"] = float(np.mean(bvals))
+                rr[f"rl_minus_{b}_mean"] = float(np.mean(dvals))
+                wins = sum(1 for dv in dvals if dv > 0.0)
+                rr[f"win_count_vs_{b}"] = wins
+                rr[f"win_rate_vs_{b}"] = wins / max(1, len(dvals))
+            rows_out.append(rr)
+        if rows_out:
+            with open(path, "w", newline="", encoding="utf-8") as f:
+                w = csv.DictWriter(f, fieldnames=list(rows_out[0].keys()))
+                w.writeheader()
+                for r in rows_out:
+                    w.writerow(r)
+
+    overall = {}
+    by_cache = {}
+    by_alpha = {}
+    for row in rows:
+        overall.setdefault((row["setting"], row["algo"]), []).append(row)
+        by_cache.setdefault((row["setting"], int(row["cache_size"])), []).append(row)
+        by_alpha.setdefault((row["setting"], float(row["alpha"])), []).append(row)
+    write_grouped(os.path.join(CONFIG["OUT_DIR"], "summary_overall.csv"), overall, ["setting", "algo"])
+    write_grouped(os.path.join(CONFIG["OUT_DIR"], "summary_by_cache.csv"), by_cache, ["setting", "cache_size"])
+    write_grouped(os.path.join(CONFIG["OUT_DIR"], "summary_by_alpha.csv"), by_alpha, ["setting", "alpha"])
+    hard = [r for r in rows if float(r["alpha"]) in {1.3, 1.4} and int(r["cache_size"]) == 16]
+    if hard:
+        write_grouped(os.path.join(CONFIG["OUT_DIR"], "summary_hard_conditions.csv"), {("hard",): hard}, ["group"])
+    if "belady" in CONFIG["BASELINES"]:
+        belady = {}
+        for row in rows:
+            belady.setdefault((row["setting"], row["algo"]), []).append(row)
+        belady_rows = []
+        for k, rs in belady.items():
+            rl = np.mean([float(x["rl_hit"]) for x in rs])
+            b = np.mean([float(x.get("baseline_hit_belady", 0.0)) for x in rs])
+            belady_rows.append({"setting": k[0], "algo": k[1], "belady_mean": b, "rl_mean": rl, "rl_minus_belady_mean": rl - b, "gap_to_belady": b - rl})
+        with open(os.path.join(CONFIG["OUT_DIR"], "summary_belady_gap.csv"), "w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=list(belady_rows[0].keys()))
             w.writeheader()
-            for row in out:
-                w.writerow(row)
+            for r in belady_rows:
+                w.writerow(r)
 
 
 # =========================
@@ -720,10 +904,40 @@ def run_all():
 
     print(f"[BASELINES] {CONFIG['BASELINES']}")
 
-    # Step 1: Optuna 최적화(딱 1회)
-    best_params = optimize_hparams(stream_cache)
-    CONFIG.update(best_params)
-    print(f"[OPTUNA] Applied best params to CONFIG: {best_params}")
+    # Step 1: Optuna or fixed params
+    used_best_params_path = None
+    if ARGS.skip_optuna:
+        if ARGS.best_params_path:
+            best_params = load_best_params(ARGS.best_params_path)
+            CONFIG.update(best_params)
+            used_best_params_path = ARGS.best_params_path
+            print(f"[PARAMS] Loaded best params from {ARGS.best_params_path}: {best_params}")
+        else:
+            print("[PARAMS] --skip_optuna set. Using CONFIG defaults.")
+    else:
+        best_params = optimize_hparams(stream_cache)
+        CONFIG.update(best_params)
+        print(f"[OPTUNA] Applied best params to CONFIG: {best_params}")
+
+    branch = commit = None
+    try:
+        branch = subprocess.check_output(["git", "rev-parse", "--abbrev-ref", "HEAD"], text=True).strip()
+        commit = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+    except Exception:
+        pass
+    with open(experiment_config_path(), "w", encoding="utf-8") as f:
+        json.dump({
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "args": vars(ARGS),
+            "final_config": CONFIG,
+            "git_branch": branch,
+            "git_commit": commit,
+            "baseline_list": CONFIG["BASELINES"],
+            "settings_list": [setting_name(s) for s in SETTINGS],
+            "optuna_used": not ARGS.skip_optuna,
+            "best_params_path": used_best_params_path,
+            "tuning_profile": ARGS.tuning_profile,
+        }, f, ensure_ascii=False, indent=2)
 
     # Step 2: 기존 실험 매트릭스 실행
     done = load_done_ids()
