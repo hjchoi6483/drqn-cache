@@ -1,3 +1,4 @@
+"""TinyLFU baseline: online frequency-aware admission policy."""
 from __future__ import annotations
 
 from collections import OrderedDict

@@ -1,3 +1,4 @@
+"""LRU baseline: recency-based cache replacement."""
 from __future__ import annotations
 
 from collections import OrderedDict

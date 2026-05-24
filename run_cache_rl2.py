@@ -1,22 +1,6 @@
-# ============================================================
-# VSCode-friendly Paper-grade Experiment Runner (FAST BASELINES) - NO HMIX
-# + Quick preset (--use_quick_preset) with practical FULL eval
-#
-# ✅ NO HMIX: HMIX 관련 코드/파라미터/결과 컬럼 전부 제거
-# ✅ alpha: 1.3, 1.4, 1.5, 1.6, 1.7, 1.8   (요청 반영)
-#
-# Run (paper-grade default):
-#   python run_cache_rl_vscode_nohmix_quick.py --out_dir out --device cuda
-#
-# Run (quick preset):
-#   python run_cache_rl_vscode_nohmix_quick.py --out_dir out --device cuda --use_quick_preset
-#
-# Outputs:
-#   out/results.csv   (run-level)
-#   out/summary.csv   (aggregated)
-#   out/logs/*.jsonl  (train logs)
-#   out/ckpt/*.pt     (resume checkpoint)
-# ============================================================
+# Main experiment runner for DRQN cache experiments.
+# This script keeps a single entry point while separating:
+# CLI, config presets/filters, training/eval, Optuna, and summaries.
 
 from __future__ import annotations
 
@@ -36,7 +20,6 @@ from src.baselines.factory import build_baselines
 from src.evaluation.evaluator import evaluate_policy_with_baselines, BaselineKey
 from src.models.drqn import (
     EpisodeReplay,
-    Obs,
     build_models,
     make_env_for_eval,
     make_obs_for_eval,
@@ -66,7 +49,7 @@ except Exception as e:
 
 
 # =========================
-# 0) CLI
+# 2) CLI parsing
 # =========================
 def parse_args():
     p = argparse.ArgumentParser()
@@ -201,11 +184,10 @@ CONFIG = {
 }
 
 # =========================
-# 1.1) QUICK PRESET
+# 5) Preset application
 # =========================
-def apply_quick_preset():
-    # 목적: “대략 돌아가는지 / 트렌드 확인”용
-    CONFIG.update({
+def apply_quick_preset(config: Dict[str, Any]):
+    config.update({
         "EXPERIMENT_TAG": "quick",
         "NUM_REQUESTS": 250_000,
 
@@ -232,8 +214,8 @@ def apply_quick_preset():
         "FULL_EVAL_STEPS": 20_000,
     })
 
-def apply_paper_opt_preset():
-    CONFIG.update({
+def apply_paper_opt_preset(config: Dict[str, Any]):
+    config.update({
         "EXPERIMENT_TAG": "paper_opt",
         "NUM_REQUESTS": 500_000,
         "TRAIN_RATIO": 0.8,
@@ -252,6 +234,17 @@ def apply_paper_opt_preset():
         "SAVE_CKPT": True,
         "SAVE_CKPT_EVERY_EP": 5,
     })
+
+
+def apply_preset(config: Dict[str, Any], preset_name: str):
+    if preset_name == "quick":
+        apply_quick_preset(config)
+    elif preset_name == "paper_opt":
+        apply_paper_opt_preset(config)
+    elif preset_name == "full":
+        config["EXPERIMENT_TAG"] = "full"
+    else:
+        raise ValueError(f"Unknown preset: {preset_name}")
 
 
 # =========================
@@ -287,45 +280,41 @@ def _parse_csv_numbers(raw: str, cast, label: str) -> List[Any]:
     return vals
 
 
-def apply_baseline_set(name: str):
+def apply_baseline_set(config: Dict[str, Any], baseline_set: str):
     baseline_sets = {
         "minimal": ["lru", "arc"],
         "diverse": ["lru", "lfu", "lruk", "2q", "arc", "tinylfu", "belady"],
         "paper": ["lru", "lfu", "lruk", "2q", "arc", "tinylfu", "wtinylfu", "belady"],
     }
-    CONFIG["BASELINES"] = list(baseline_sets[name])
+    if baseline_set not in baseline_sets:
+        raise ValueError(f"Unknown baseline set: {baseline_set}")
+    config["BASELINES"] = list(baseline_sets[baseline_set])
 
 
-def apply_cli_overrides():
-    selected_preset = ARGS.preset
-    if ARGS.use_quick_preset:
-        if ARGS.preset != "quick":
+def apply_cli_filters(config: Dict[str, Any], args: argparse.Namespace):
+    selected_preset = args.preset
+    if args.use_quick_preset:
+        if args.preset != "quick":
             print("[WARN] --use_quick_preset overrides --preset. Using quick preset.")
         selected_preset = "quick"
-    if selected_preset == "quick":
-        apply_quick_preset()
-    elif selected_preset == "paper_opt":
-        apply_paper_opt_preset()
-    else:
-        CONFIG["EXPERIMENT_TAG"] = "full"
+    apply_preset(config, selected_preset)
+    apply_baseline_set(config, args.baseline_set)
 
-    apply_baseline_set(ARGS.baseline_set)
-
-    if ARGS.only_alpha is not None:
-        CONFIG["ZIPF_ALPHAS"] = _parse_csv_numbers(ARGS.only_alpha, float, "alpha")
-    if ARGS.only_cache is not None:
-        CONFIG["CACHE_SIZES"] = _parse_csv_numbers(ARGS.only_cache, int, "cache_size")
-    if ARGS.seeds is not None:
-        CONFIG["SEEDS"] = _parse_csv_numbers(ARGS.seeds, int, "seed")
+    if args.only_alpha is not None:
+        config["ZIPF_ALPHAS"] = _parse_csv_numbers(args.only_alpha, float, "alpha")
+    if args.only_cache is not None:
+        config["CACHE_SIZES"] = _parse_csv_numbers(args.only_cache, int, "cache_size")
+    if args.seeds is not None:
+        config["SEEDS"] = _parse_csv_numbers(args.seeds, int, "seed")
 
     global SETTINGS
-    if ARGS.only_algo is not None:
-        SETTINGS = [s for s in SETTINGS if s.algo == ARGS.only_algo]
+    if args.only_algo is not None:
+        SETTINGS = [s for s in SETTINGS if s.algo == args.only_algo]
         if not SETTINGS:
-            raise ValueError(f"No SETTINGS matched --only_algo={ARGS.only_algo}")
+            raise ValueError(f"No SETTINGS matched --only_algo={args.only_algo}")
 
 
-apply_cli_overrides()
+apply_cli_filters(CONFIG, ARGS)
 
 
 # =========================
@@ -372,6 +361,28 @@ def summary_csv_path() -> str:
     return os.path.join(CONFIG["OUT_DIR"], "summary.csv")
 def experiment_config_path() -> str:
     return os.path.join(CONFIG["OUT_DIR"], "experiment_config.json")
+
+
+def save_experiment_config(config: Dict[str, Any], args: argparse.Namespace, settings: List[Setting], used_best_params_path: str | None):
+    branch = commit = None
+    try:
+        branch = subprocess.check_output(["git", "rev-parse", "--abbrev-ref", "HEAD"], text=True).strip()
+        commit = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+    except Exception:
+        pass
+    with open(experiment_config_path(), "w", encoding="utf-8") as f:
+        json.dump({
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "args": vars(args),
+            "final_config": config,
+            "git_branch": branch,
+            "git_commit": commit,
+            "baseline_list": config["BASELINES"],
+            "settings_list": [setting_name(s) for s in settings],
+            "optuna_used": not args.skip_optuna,
+            "best_params_path": used_best_params_path,
+            "tuning_profile": args.tuning_profile,
+        }, f, ensure_ascii=False, indent=2)
 
 def write_row_csv(path: str, row: dict):
     exists = os.path.exists(path)
@@ -673,10 +684,10 @@ def build_stream_cache() -> Dict[Tuple[str, float, int], Dict[str, List[int]]]:
     return stream_cache
 
 
-def representative_grid(profile: str) -> List[Tuple[str, float, int, int]]:
+def get_tuning_grid(config: Dict[str, Any], profile: str) -> List[Tuple[str, float, int, int]]:
     alphas = [1.3, 1.8] if profile == "quick" else [1.3, 1.5, 1.8]
     caches = [16, 64]
-    seeds = CONFIG["SEEDS"][:1] if profile in {"quick", "paper"} else (CONFIG["SEEDS"][:2] if len(CONFIG["SEEDS"]) >= 2 else CONFIG["SEEDS"][:1])
+    seeds = config["SEEDS"][:1] if profile in {"quick", "paper"} else (config["SEEDS"][:2] if len(config["SEEDS"]) >= 2 else config["SEEDS"][:1])
     out = []
     for a in alphas:
         for c in caches:
@@ -685,20 +696,30 @@ def representative_grid(profile: str) -> List[Tuple[str, float, int, int]]:
     return out
 
 
-def objective(trial: optuna.trial.Trial, stream_cache: Dict[Tuple[str, float, int], Dict[str, List[int]]]) -> float:
-    CONFIG["LR"] = trial.suggest_float("LR", 3e-5, 8e-4, log=True)
-    CONFIG["GAMMA"] = trial.suggest_float("GAMMA", 0.92, 0.995)
-    CONFIG["UNROLL"] = trial.suggest_categorical("UNROLL", [30, 40, 60, 80])
-    CONFIG["BATCH_SIZE"] = trial.suggest_categorical("BATCH_SIZE", [16, 32, 64])
-    CONFIG["TARGET_UPDATE_EVERY_UPDATES"] = trial.suggest_categorical("TARGET_UPDATE_EVERY_UPDATES", [200, 500, 1000])
-    CONFIG["UPDATES_PER_EPISODE"] = trial.suggest_categorical("UPDATES_PER_EPISODE", [8, 12, 16])
-    CONFIG["EPSILON_DECAY_STEPS"] = trial.suggest_categorical("EPSILON_DECAY_STEPS", [100_000, 200_000, 300_000])
-    if CONFIG["USE_TWO_STAGE_TINYLFU"]:
-        CONFIG["RECENT_WINDOW_SIZE"] = trial.suggest_categorical("RECENT_WINDOW_SIZE", [500, 1000, 5000])
-        CONFIG["TINYLFU_MIN_ADMIT_COUNT"] = trial.suggest_categorical("TINYLFU_MIN_ADMIT_COUNT", [1, 2, 3])
-        CONFIG["RECENT_FREQ_DENOM"] = trial.suggest_categorical("RECENT_FREQ_DENOM", [10.0, 20.0, 50.0])
+def suggest_hparams(trial: optuna.trial.Trial, config: Dict[str, Any]) -> None:
+    config["LR"] = trial.suggest_float("LR", 3e-5, 8e-4, log=True)
+    config["GAMMA"] = trial.suggest_float("GAMMA", 0.92, 0.995)
+    config["UNROLL"] = trial.suggest_categorical("UNROLL", [30, 40, 60, 80])
+    config["BATCH_SIZE"] = trial.suggest_categorical("BATCH_SIZE", [16, 32, 64])
+    config["TARGET_UPDATE_EVERY_UPDATES"] = trial.suggest_categorical("TARGET_UPDATE_EVERY_UPDATES", [200, 500, 1000])
+    config["UPDATES_PER_EPISODE"] = trial.suggest_categorical("UPDATES_PER_EPISODE", [8, 12, 16])
+    config["EPSILON_DECAY_STEPS"] = trial.suggest_categorical("EPSILON_DECAY_STEPS", [100_000, 200_000, 300_000])
+    if config["USE_TWO_STAGE_TINYLFU"]:
+        config["RECENT_WINDOW_SIZE"] = trial.suggest_categorical("RECENT_WINDOW_SIZE", [500, 1000, 5000])
+        config["TINYLFU_MIN_ADMIT_COUNT"] = trial.suggest_categorical("TINYLFU_MIN_ADMIT_COUNT", [1, 2, 3])
+        config["RECENT_FREQ_DENOM"] = trial.suggest_categorical("RECENT_FREQ_DENOM", [10.0, 20.0, 50.0])
 
-    scenario_grid = representative_grid(ARGS.tuning_profile)
+
+def compute_objective_score(scores: List[float]) -> float:
+    if not scores:
+        return 0.0
+    return float(0.8 * np.mean(scores) + 0.2 * np.min(scores))
+
+
+def objective(trial: optuna.trial.Trial, stream_cache: Dict[Tuple[str, float, int], Dict[str, List[int]]]) -> float:
+    suggest_hparams(trial, CONFIG)
+
+    scenario_grid = get_tuning_grid(CONFIG, ARGS.tuning_profile)
     setting = SETTINGS[0]
     scores: List[float] = []
     scenario_scores: List[Dict[str, Any]] = []
@@ -735,7 +756,7 @@ def objective(trial: optuna.trial.Trial, stream_cache: Dict[Tuple[str, float, in
     std_score = float(np.std(scores, ddof=1)) if len(scores) > 1 else 0.0
     hard_scores = [x["score"] for x in scenario_scores if x["alpha"] == 1.3 and x["cache_size"] == 16]
     hard_score = float(np.mean(hard_scores)) if hard_scores else min_score
-    objective_score = 0.8 * mean_score + 0.2 * min_score
+    objective_score = compute_objective_score(scores)
     trial.set_user_attr("mean_score", mean_score)
     trial.set_user_attr("min_score", min_score)
     trial.set_user_attr("std_score", std_score)
@@ -904,40 +925,25 @@ def run_all():
 
     print(f"[BASELINES] {CONFIG['BASELINES']}")
 
-    # Step 1: Optuna or fixed params
+    # Step 1: experiment mode
     used_best_params_path = None
     if ARGS.skip_optuna:
         if ARGS.best_params_path:
+            print("[MODE] Fixed best_params evaluation")
             best_params = load_best_params(ARGS.best_params_path)
             CONFIG.update(best_params)
             used_best_params_path = ARGS.best_params_path
             print(f"[PARAMS] Loaded best params from {ARGS.best_params_path}: {best_params}")
         else:
+            print("[MODE] Default CONFIG evaluation")
             print("[PARAMS] --skip_optuna set. Using CONFIG defaults.")
     else:
+        print("[MODE] Optuna tuning enabled")
         best_params = optimize_hparams(stream_cache)
         CONFIG.update(best_params)
         print(f"[OPTUNA] Applied best params to CONFIG: {best_params}")
 
-    branch = commit = None
-    try:
-        branch = subprocess.check_output(["git", "rev-parse", "--abbrev-ref", "HEAD"], text=True).strip()
-        commit = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
-    except Exception:
-        pass
-    with open(experiment_config_path(), "w", encoding="utf-8") as f:
-        json.dump({
-            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-            "args": vars(ARGS),
-            "final_config": CONFIG,
-            "git_branch": branch,
-            "git_commit": commit,
-            "baseline_list": CONFIG["BASELINES"],
-            "settings_list": [setting_name(s) for s in SETTINGS],
-            "optuna_used": not ARGS.skip_optuna,
-            "best_params_path": used_best_params_path,
-            "tuning_profile": ARGS.tuning_profile,
-        }, f, ensure_ascii=False, indent=2)
+    save_experiment_config(CONFIG, ARGS, SETTINGS, used_best_params_path)
 
     # Step 2: 기존 실험 매트릭스 실행
     done = load_done_ids()

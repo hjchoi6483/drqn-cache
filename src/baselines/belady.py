@@ -1,3 +1,4 @@
+"""Belady baseline: offline upper bound using future trace (not online deployable)."""
 from __future__ import annotations
 
 from collections import defaultdict, deque

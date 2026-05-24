@@ -1,3 +1,4 @@
+"""LRU-K baseline: K-history recency approximation."""
 from __future__ import annotations
 
 from collections import deque

@@ -150,3 +150,49 @@ objective는 `0.8 * mean(scores) + 0.2 * min(scores)`를 사용해 평균 성능
    - CUDA 요청 시 사용 가능 여부/인덱스 유효성 검사
 4. **행동 제약 일관성**
    - `valid_action_mask`로 hit/empty 상태에서 `NOOP`만 유효하게 처리
+
+## Experiment control quick guide
+
+### Quick smoke run
+```bash
+python run_cache_rl2.py \
+  --preset quick \
+  --only_alpha 1.3 \
+  --only_cache 16 \
+  --seeds 0 \
+  --only_algo drqn_perslot \
+  --baseline_set minimal \
+  --skip_optuna \
+  --out_dir out_smoke_cleanup \
+  --device cpu
+```
+
+### Lightweight Optuna tuning run
+```bash
+python run_cache_rl2.py \
+  --out_dir /content/out_tune_light_two_stage \
+  --device cuda \
+  --preset quick \
+  --tuning_profile quick \
+  --optuna_trials 10 \
+  --baseline_set minimal \
+  --only_algo drqn_perslot
+```
+
+### Fixed best_params paper_opt run
+```bash
+python run_cache_rl2.py \
+  --out_dir /content/drive/MyDrive/drqn-cache-results/out_paper_two_stage_fixed \
+  --device cuda \
+  --preset paper_opt \
+  --skip_optuna \
+  --best_params_path /content/drive/MyDrive/drqn-cache-results/out_tune_light_two_stage/best_params.json \
+  --baseline_set paper \
+  --only_algo drqn_perslot \
+  --seeds 0,1,2,3,4
+```
+
+### Notes
+- Prefer local `/content` during Optuna tuning to reduce Google Drive I/O overhead.
+- Copy `best_params.json` to Drive after tuning.
+- Use Drive `out_dir` for long persistence-focused final runs.

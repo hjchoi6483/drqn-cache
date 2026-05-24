@@ -14,6 +14,7 @@ def _trace_fingerprint(test_stream: List[int]) -> str:
     return h.hexdigest()
 
 
+# Baselines are computed once per scenario/cache/eval_kind/baseline set and cached.
 def compute_baselines_once(
     scenario: str,
     alpha: float,
@@ -70,6 +71,7 @@ def evaluate_policy_with_baselines(
     env = make_env_fn(cache_size, s)
     hidden = model.init_hidden(1)
 
+    # RL hit rate is based on env.step() hit boolean; bypass is a miss by definition.
     rl_hits = 0
     rl_miss = 0
     for req in test_stream:

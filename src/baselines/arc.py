@@ -1,3 +1,4 @@
+"""ARC baseline: adaptive replacement cache."""
 from __future__ import annotations
 
 from collections import OrderedDict

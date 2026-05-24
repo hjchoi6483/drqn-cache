@@ -1,3 +1,4 @@
+"""2Q baseline: two-queue recency/frequency approximation."""
 from __future__ import annotations
 
 from collections import OrderedDict, deque
