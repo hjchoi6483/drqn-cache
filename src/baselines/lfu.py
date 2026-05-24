@@ -1,3 +1,4 @@
+"""LFU baseline: frequency-based replacement with LRU tie-break behavior."""
 from __future__ import annotations
 
 from collections import OrderedDict

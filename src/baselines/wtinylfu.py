@@ -1,3 +1,4 @@
+"""W-TinyLFU baseline: windowed TinyLFU admission with LRU window."""
 from __future__ import annotations
 
 from collections import OrderedDict, deque

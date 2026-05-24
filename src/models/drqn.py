@@ -13,6 +13,10 @@ import torch.nn.functional as F
 
 @dataclass
 class Obs:
+    # cache_feat: per-slot state features
+    # global_feat: cache-level runtime state
+    # req_feat: current request/admission features
+    # valid_mask: legal actions after two-stage admission gate
     cache_feat: np.ndarray
     global_feat: np.ndarray
     req_feat: np.ndarray
@@ -104,6 +108,7 @@ class CacheEnv:
         return feats
 
     def should_admit(self, req_id: int) -> bool:
+        # Two-stage TinyLFU admission gate based only on past counts.
         if not self.use_two_stage_tinylfu:
             return True
         if self._has_item(req_id) or self._has_empty():
@@ -154,6 +159,7 @@ class CacheEnv:
         return np.asarray([occupancy, self.hit_ema, miss_norm], dtype=np.float32)
 
     def valid_action_mask(self, req_id: int) -> np.ndarray:
+        # Action 0 = keep/bypass; 1..S = eviction slot when admission is allowed.
         mask = np.zeros((self.cache_size + 1,), dtype=np.bool_)
         hit = self._has_item(req_id)
         empty = self._has_empty()
@@ -177,6 +183,7 @@ class CacheEnv:
             self.miss_streak = min(self.miss_streak + 1, self.miss_streak_clip)
 
     def step(self, req_id: int, action: int) -> Tuple[float, bool]:
+        # Important: should_admit() is evaluated before _update_stats() to avoid leakage.
         self.t += 1
         if self._has_item(req_id):
             self._update_stats(req_id)
