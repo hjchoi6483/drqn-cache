@@ -73,6 +73,30 @@ python run_cache_rl2.py --out_dir out_full --device cpu --preset full --optuna_t
 
 > GPU 사용 시 `--device cuda` 또는 `--device cuda:0` 지정.
 
+### 중단 후 재시작
+
+기본 재시작 방식은 `--resume_mode rerun_incomplete`입니다. 같은 `--out_dir`로 다시 실행하면 `results.csv`에 최종 결과 행이 있는 완료 set은 건너뛰고, 결과 행 없이 중간에 멈춘 set은 기존 체크포인트/로그를 `incomplete_archive/`로 옮긴 뒤 처음부터 다시 실행합니다.
+
+```bash
+python run_cache_rl2.py \
+  --out_dir out_full \
+  --device cpu \
+  --preset full \
+  --skip_optuna \
+  --resume_mode rerun_incomplete
+```
+
+중간 체크포인트에서 이어서 학습하고 싶다면 `--resume_mode checkpoint`를 사용합니다.
+
+```bash
+python run_cache_rl2.py \
+  --out_dir out_full \
+  --device cpu \
+  --preset full \
+  --skip_optuna \
+  --resume_mode checkpoint
+```
+
 ---
 
 ## 기본 설정(코드 기준)
