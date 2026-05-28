@@ -11,6 +11,7 @@ import csv
 import time
 import random
 import argparse
+import shutil
 from dataclasses import dataclass, asdict
 from typing import List, Tuple, Dict, Any
 
@@ -68,6 +69,16 @@ def parse_args():
     p.add_argument("--study_name", type=str, default=None)
     p.add_argument("--optuna_storage", type=str, default=None)
     p.add_argument("--optuna_trials", type=int, default=40, help="Optuna trial 횟수 (기본: 40)")
+    p.add_argument(
+        "--resume_mode",
+        type=str,
+        choices=["rerun_incomplete", "checkpoint"],
+        default="rerun_incomplete",
+        help=(
+            "재시작 방식: rerun_incomplete=results.csv에 없는 중단 set은 처음부터 다시 실행(기본), "
+            "checkpoint=ckpt가 있으면 이어서 학습"
+        ),
+    )
     return p.parse_args()
 
 ARGS = parse_args()
@@ -382,6 +393,7 @@ def save_experiment_config(config: Dict[str, Any], args: argparse.Namespace, set
             "optuna_used": not args.skip_optuna,
             "best_params_path": used_best_params_path,
             "tuning_profile": args.tuning_profile,
+            "resume_mode": args.resume_mode,
         }, f, ensure_ascii=False, indent=2)
 
 def write_row_csv(path: str, row: dict):
@@ -392,6 +404,22 @@ def write_row_csv(path: str, row: dict):
             w.writeheader()
         w.writerow(row)
 
+COMPLETION_REQUIRED_COLUMNS = ("run_id", "rl_hit", "train_episodes", "total_updates")
+
+
+def is_completed_result_row(row: Dict[str, Any]) -> bool:
+    """Return True only for result rows that look like finalized experiments."""
+    if not row or any(not str(row.get(col, "")).strip() for col in COMPLETION_REQUIRED_COLUMNS):
+        return False
+    try:
+        float(row["rl_hit"])
+        int(float(row["train_episodes"]))
+        int(float(row["total_updates"]))
+    except (TypeError, ValueError):
+        return False
+    return True
+
+
 def load_done_ids() -> set:
     p = results_csv_path()
     if not os.path.exists(p):
@@ -400,8 +428,49 @@ def load_done_ids() -> set:
     with open(p, "r", encoding="utf-8") as f:
         r = csv.DictReader(f)
         for row in r:
-            done.add(row["run_id"])
+            if is_completed_result_row(row):
+                done.add(row["run_id"])
     return done
+
+
+def incomplete_archive_dir(rid: str) -> str:
+    stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+    return os.path.join(CONFIG["OUT_DIR"], "incomplete_archive", f"{safe_filename(rid)}_{stamp}")
+
+
+def archive_incomplete_artifacts(rid: str) -> List[str]:
+    """Move stale checkpoint/log files aside before rerunning an unfinished set."""
+    moved: List[str] = []
+    paths = [ckpt_path(rid), log_path(rid)]
+    existing = [path for path in paths if os.path.exists(path)]
+    if not existing:
+        return moved
+
+    archive_dir = incomplete_archive_dir(rid)
+    os.makedirs(archive_dir, exist_ok=True)
+    for path in existing:
+        dst = os.path.join(archive_dir, os.path.basename(path))
+        shutil.move(path, dst)
+        moved.append(dst)
+    return moved
+
+
+def prepare_incomplete_restart(rid: str, persist_result: bool) -> Any | None:
+    """Load or reset an unfinished run according to --resume_mode."""
+    if persist_result and ARGS.resume_mode == "rerun_incomplete":
+        moved = archive_incomplete_artifacts(rid)
+        if moved:
+            print(
+                f"[RERUN INCOMPLETE] {rid} has no completed result row; "
+                f"archived stale artifacts and restarting from episode 0: {moved}",
+                flush=True,
+            )
+        return None
+
+    loaded = load_ckpt(rid)
+    if loaded is not None:
+        print(f"[CHECKPOINT FOUND] {rid} ({ARGS.resume_mode})", flush=True)
+    return loaded
 
 
 # =========================
@@ -501,11 +570,12 @@ def train_one_run(
     if persist_result:
         done = load_done_ids()
         if rid in done:
+            print(f"[SKIP DONE] {rid} already has a completed result row.", flush=True)
             return None
 
     set_seed(seed)
 
-    loaded = load_ckpt(rid)
+    loaded = prepare_incomplete_restart(rid, persist_result)
     if loaded is not None:
         st = TrainState(**loaded["state"])
         online, target = build_models(cache_size, s, DEVICE)
