@@ -42,6 +42,7 @@ except Exception as e:
 
 try:
     from optuna.exceptions import TrialPruned
+    from optuna.trial import TrialState
 except Exception as e:
     raise RuntimeError(
         "Optuna가 필요함. 예) pip install optuna\n"
@@ -68,7 +69,17 @@ def parse_args():
     p.add_argument("--baseline_set", type=str, choices=["minimal", "diverse", "paper"], default="paper")
     p.add_argument("--study_name", type=str, default=None)
     p.add_argument("--optuna_storage", type=str, default=None)
-    p.add_argument("--optuna_trials", type=int, default=40, help="Optuna trial 횟수 (기본: 40)")
+    p.add_argument("--optuna_trials", type=int, default=40, help="Optuna trial 횟수/목표 COMPLETE trial 수 (기본: 40)")
+    p.add_argument(
+        "--optuna_trials_mode",
+        type=str,
+        choices=["target_total", "additional"],
+        default="target_total",
+        help=(
+            "Optuna trial 해석: target_total=study의 목표 COMPLETE trial 총수(기본), "
+            "additional=이번 실행에서 추가로 실행할 trial 수"
+        ),
+    )
     p.add_argument(
         "--resume_mode",
         type=str,
@@ -83,6 +94,12 @@ def parse_args():
 
 ARGS = parse_args()
 OUT_DIR = ARGS.out_dir
+OPTUNA_RUN_INFO: Dict[str, Any] = {
+    "optuna_completed_trials_before_run": None,
+    "optuna_remaining_trials_requested": None,
+    "optuna_storage": None,
+    "study_name": None,
+}
 
 def configure_torch_runtime(device_arg: str) -> torch.device:
     requested = (device_arg or "cuda").lower().strip()
@@ -374,6 +391,45 @@ def experiment_config_path() -> str:
     return os.path.join(CONFIG["OUT_DIR"], "experiment_config.json")
 
 
+def get_optuna_storage_path() -> str:
+    return ARGS.optuna_storage or f"sqlite:///{CONFIG['OUT_DIR']}/optuna_{CONFIG['EXPERIMENT_TAG']}_{ARGS.tuning_profile}.db"
+
+
+def get_study_name() -> str:
+    algo_name = SETTINGS[0].algo if SETTINGS else "none"
+    twostage = "twostage" if CONFIG.get("USE_TWO_STAGE_TINYLFU", False) else "nostage"
+    default_study_name = f"{CONFIG['EXPERIMENT_TAG']}_{ARGS.tuning_profile}_{algo_name}_{twostage}"
+    return ARGS.study_name or default_study_name
+
+
+def count_trials_by_state(study: optuna.study.Study) -> Dict[TrialState, int]:
+    counts = {state: 0 for state in TrialState}
+    for trial in study.trials:
+        counts[trial.state] = counts.get(trial.state, 0) + 1
+    return counts
+
+
+def compute_remaining_optuna_trials(completed_trials: int, requested_trials: int, mode: str = "target_total") -> int:
+    if completed_trials < 0:
+        raise ValueError(f"completed_trials must be non-negative, got {completed_trials}")
+    if requested_trials < 0:
+        raise ValueError(f"requested_trials must be non-negative, got {requested_trials}")
+    if mode == "target_total":
+        return max(0, requested_trials - completed_trials)
+    if mode == "additional":
+        return requested_trials
+    raise ValueError(f"Unknown optuna_trials_mode: {mode}")
+
+
+def update_optuna_run_info(completed_before: int | None, remaining_requested: int | None, storage: str | None, study_name: str | None) -> None:
+    OPTUNA_RUN_INFO.update({
+        "optuna_completed_trials_before_run": completed_before,
+        "optuna_remaining_trials_requested": remaining_requested,
+        "optuna_storage": storage,
+        "study_name": study_name,
+    })
+
+
 def save_experiment_config(config: Dict[str, Any], args: argparse.Namespace, settings: List[Setting], used_best_params_path: str | None):
     branch = commit = None
     try:
@@ -391,6 +447,12 @@ def save_experiment_config(config: Dict[str, Any], args: argparse.Namespace, set
             "baseline_list": config["BASELINES"],
             "settings_list": [setting_name(s) for s in settings],
             "optuna_used": not args.skip_optuna,
+            "optuna_trials": args.optuna_trials,
+            "optuna_trials_mode": args.optuna_trials_mode,
+            "optuna_completed_trials_before_run": OPTUNA_RUN_INFO.get("optuna_completed_trials_before_run"),
+            "optuna_remaining_trials_requested": OPTUNA_RUN_INFO.get("optuna_remaining_trials_requested"),
+            "optuna_storage": OPTUNA_RUN_INFO.get("optuna_storage") or get_optuna_storage_path(),
+            "study_name": OPTUNA_RUN_INFO.get("study_name") or get_study_name(),
             "best_params_path": used_best_params_path,
             "tuning_profile": args.tuning_profile,
             "resume_mode": args.resume_mode,
@@ -837,18 +899,65 @@ def objective(trial: optuna.trial.Trial, stream_cache: Dict[Tuple[str, float, in
 
 def optimize_hparams(stream_cache: Dict[Tuple[str, float, int], Dict[str, List[int]]]) -> Dict[str, float]:
     print("\n[OPTUNA] Starting hyperparameter optimization...")
-    algo_name = SETTINGS[0].algo if SETTINGS else "none"
-    twostage = "twostage" if CONFIG.get("USE_TWO_STAGE_TINYLFU", False) else "nostage"
-    default_study_name = f"{CONFIG['EXPERIMENT_TAG']}_{ARGS.tuning_profile}_{algo_name}_{twostage}"
-    storage = ARGS.optuna_storage or f"sqlite:///{CONFIG['OUT_DIR']}/optuna_{CONFIG['EXPERIMENT_TAG']}_{ARGS.tuning_profile}.db"
+    study_name = get_study_name()
+    storage = get_optuna_storage_path()
     study = optuna.create_study(
         direction="maximize",
         pruner=optuna.pruners.MedianPruner(),
         storage=storage,
-        study_name=ARGS.study_name or default_study_name,
+        study_name=study_name,
         load_if_exists=True,
     )
-    study.optimize(lambda trial: objective(trial, stream_cache), n_trials=int(ARGS.optuna_trials))
+
+    trial_counts = count_trials_by_state(study)
+    completed_trials = trial_counts.get(TrialState.COMPLETE, 0)
+    running_trials = trial_counts.get(TrialState.RUNNING, 0)
+    remaining_trials = compute_remaining_optuna_trials(
+        completed_trials=completed_trials,
+        requested_trials=int(ARGS.optuna_trials),
+        mode=ARGS.optuna_trials_mode,
+    )
+    update_optuna_run_info(completed_trials, remaining_trials, storage, study_name)
+
+    if running_trials:
+        print(
+            f"[OPTUNA RESUME WARNING] study={study_name} has {running_trials} existing RUNNING trial(s); "
+            "they are not counted toward the COMPLETE target.",
+            flush=True,
+        )
+
+    if ARGS.optuna_trials_mode == "target_total":
+        if remaining_trials == 0:
+            print(
+                f"[OPTUNA RESUME] study={study_name} completed={completed_trials} "
+                f"target={int(ARGS.optuna_trials)} remaining=0; skipping optimization.",
+                flush=True,
+            )
+        else:
+            print(
+                f"[OPTUNA RESUME] study={study_name} completed={completed_trials} "
+                f"target={int(ARGS.optuna_trials)} remaining={remaining_trials}",
+                flush=True,
+            )
+    else:
+        print(
+            f"[OPTUNA RESUME] study={study_name} completed={completed_trials} "
+            f"mode=additional requested={int(ARGS.optuna_trials)} remaining={remaining_trials}",
+            flush=True,
+        )
+
+    if remaining_trials > 0:
+        study.optimize(lambda trial: objective(trial, stream_cache), n_trials=remaining_trials)
+
+    final_counts = count_trials_by_state(study)
+    if final_counts.get(TrialState.COMPLETE, 0) == 0:
+        raise ValueError(
+            "No completed Optuna trials exist for this study; cannot load best_params. "
+            f"completed=0, requested={int(ARGS.optuna_trials)}, mode={ARGS.optuna_trials_mode}, "
+            f"remaining={remaining_trials}. If target is already satisfied or invalid, increase --optuna_trials "
+            "or use --optuna_trials_mode additional to run new trials."
+        )
+
     best_params = dict(study.best_params)
     with open(os.path.join(CONFIG["OUT_DIR"], "best_params.json"), "w", encoding="utf-8") as f:
         json.dump(best_params, f, ensure_ascii=False, indent=2)
