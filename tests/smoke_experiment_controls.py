@@ -13,9 +13,11 @@ assert r._parse_csv_numbers('1.3,1.4', float, 'alpha') == [1.3, 1.4]
 assert r._parse_csv_numbers('16,64', int, 'cache') == [16, 64]
 assert r._parse_csv_numbers('0,1,2', int, 'seed') == [0, 1, 2]
 assert r.compute_remaining_optuna_trials(25, 40, 'target_total') == 15
+assert r.compute_remaining_optuna_trials(25 + 5, 40, 'target_total') == 10
 assert r.compute_remaining_optuna_trials(40, 40, 'target_total') == 0
 assert r.compute_remaining_optuna_trials(45, 40, 'target_total') == 0
 assert r.compute_remaining_optuna_trials(25, 40, 'additional') == 40
+assert r.count_finished_optuna_trials({r.TrialState.COMPLETE: 25, r.TrialState.PRUNED: 5}) == 30
 r.apply_baseline_set(r.CONFIG, 'minimal')
 assert r.CONFIG['BASELINES'] == ['lru', 'arc']
 

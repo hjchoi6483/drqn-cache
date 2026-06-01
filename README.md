@@ -139,9 +139,9 @@ objective는 `0.8 * mean(scores) + 0.2 * min(scores)`를 사용해 평균 성능
 
 기본 Optuna storage는 기존과 동일하게 `sqlite:///{OUT_DIR}/optuna_{EXPERIMENT_TAG}_{tuning_profile}.db`이며, study는 `load_if_exists=True`로 불러옵니다. 따라서 같은 `--out_dir`, `--preset`, `--tuning_profile`, `--only_algo`/stage 조합을 다시 실행하면 이전 study를 이어서 사용합니다.
 
-기본값인 `--optuna_trials_mode target_total`에서는 `--optuna_trials`가 **이번 실행에서 새로 추가할 trial 수**가 아니라 **study 안의 목표 COMPLETE trial 총수**를 의미합니다. 예를 들어 첫 실행이 25개의 COMPLETE trial 이후 중단되었고 같은 명령을 `--optuna_trials 40`으로 다시 실행하면, 러너는 자동으로 남은 15개만 요청해 총 40개 COMPLETE trial까지 채웁니다. 이미 40개 이상의 COMPLETE trial이 있으면 optimization을 건너뛰고 기존 `study.best_params`를 사용합니다. PRUNED/FAIL/RUNNING trial은 목표 COMPLETE trial 수에 포함하지 않으며, 기존 RUNNING trial이 있으면 경고만 출력하고 삭제하지 않습니다.
+기본값인 `--optuna_trials_mode target_total`에서는 `--optuna_trials`가 **이번 실행에서 새로 추가할 trial 수**가 아니라 **study 안의 목표 완료 trial 총수(COMPLETE+PRUNED)**를 의미합니다. 예를 들어 첫 실행이 25개의 완료 trial(COMPLETE+PRUNED) 이후 중단되었고 같은 명령을 `--optuna_trials 40`으로 다시 실행하면, 러너는 자동으로 남은 15개만 요청해 총 40개 완료 trial(COMPLETE+PRUNED)까지 채웁니다. 이미 40개 이상의 완료 trial(COMPLETE+PRUNED)이 있으면 optimization을 건너뛰고 기존 `study.best_params`를 사용합니다. PRUNED trial은 목표 완료 trial 수에 포함하고, FAIL/RUNNING trial은 포함하지 않으며, 기존 RUNNING trial이 있으면 경고만 출력하고 삭제하지 않습니다.
 
-의도적으로 매 실행마다 trial을 더 추가하고 싶다면 예전 동작과 같은 `--optuna_trials_mode additional`을 지정합니다. 이 모드에서 `--optuna_trials 40`은 현재 COMPLETE trial 수와 무관하게 이번 프로세스에서 40개 trial을 추가로 요청합니다.
+의도적으로 매 실행마다 trial을 더 추가하고 싶다면 예전 동작과 같은 `--optuna_trials_mode additional`을 지정합니다. 이 모드에서 `--optuna_trials 40`은 현재 완료 trial 수와 무관하게 이번 프로세스에서 40개 trial을 추가로 요청합니다.
 
 Colab에서 중단 후 자동 재개를 활용하는 예시:
 
@@ -172,7 +172,7 @@ python run_cache_rl2.py \
 ## 출력 파일
 
 - `OUT_DIR/best_params.json`: Optuna 최고 파라미터
-- `OUT_DIR/experiment_config.json`: 실행 메타데이터/최종 CONFIG/CLI 인자/깃 정보 및 Optuna 재개 메타데이터(`optuna_trials`, `optuna_trials_mode`, `optuna_completed_trials_before_run`, `optuna_remaining_trials_requested`, `optuna_storage`, `study_name`)
+- `OUT_DIR/experiment_config.json`: 실행 메타데이터/최종 CONFIG/CLI 인자/깃 정보 및 Optuna 재개 메타데이터(`optuna_trials`, `optuna_trials_mode`, `optuna_completed_trials_before_run`, `optuna_pruned_trials_before_run`, `optuna_finished_trials_before_run`, `optuna_remaining_trials_requested`, `optuna_storage`, `study_name`)
 - `OUT_DIR/results.csv`: run-level 결과
 - `OUT_DIR/summary.csv`: 그룹 집계 결과
 - `OUT_DIR/summary_overall.csv`

@@ -69,14 +69,14 @@ def parse_args():
     p.add_argument("--baseline_set", type=str, choices=["minimal", "diverse", "paper"], default="paper")
     p.add_argument("--study_name", type=str, default=None)
     p.add_argument("--optuna_storage", type=str, default=None)
-    p.add_argument("--optuna_trials", type=int, default=40, help="Optuna trial 횟수/목표 COMPLETE trial 수 (기본: 40)")
+    p.add_argument("--optuna_trials", type=int, default=40, help="Optuna trial 횟수/목표 완료 trial 수(COMPLETE+PRUNED, 기본: 40)")
     p.add_argument(
         "--optuna_trials_mode",
         type=str,
         choices=["target_total", "additional"],
         default="target_total",
         help=(
-            "Optuna trial 해석: target_total=study의 목표 COMPLETE trial 총수(기본), "
+            "Optuna trial 해석: target_total=study의 목표 완료 trial 총수(COMPLETE+PRUNED, 기본), "
             "additional=이번 실행에서 추가로 실행할 trial 수"
         ),
     )
@@ -96,6 +96,8 @@ ARGS = parse_args()
 OUT_DIR = ARGS.out_dir
 OPTUNA_RUN_INFO: Dict[str, Any] = {
     "optuna_completed_trials_before_run": None,
+    "optuna_pruned_trials_before_run": None,
+    "optuna_finished_trials_before_run": None,
     "optuna_remaining_trials_requested": None,
     "optuna_storage": None,
     "study_name": None,
@@ -409,21 +411,39 @@ def count_trials_by_state(study: optuna.study.Study) -> Dict[TrialState, int]:
     return counts
 
 
-def compute_remaining_optuna_trials(completed_trials: int, requested_trials: int, mode: str = "target_total") -> int:
-    if completed_trials < 0:
-        raise ValueError(f"completed_trials must be non-negative, got {completed_trials}")
+def count_finished_optuna_trials(trial_counts: Dict[TrialState, int]) -> int:
+    """Count trials that should satisfy the resume target.
+
+    Optuna marks pruned trials as terminal, so resume should not request
+    replacements for them when --optuna_trials_mode target_total is used.
+    """
+    return trial_counts.get(TrialState.COMPLETE, 0) + trial_counts.get(TrialState.PRUNED, 0)
+
+
+def compute_remaining_optuna_trials(finished_trials: int, requested_trials: int, mode: str = "target_total") -> int:
+    if finished_trials < 0:
+        raise ValueError(f"finished_trials must be non-negative, got {finished_trials}")
     if requested_trials < 0:
         raise ValueError(f"requested_trials must be non-negative, got {requested_trials}")
     if mode == "target_total":
-        return max(0, requested_trials - completed_trials)
+        return max(0, requested_trials - finished_trials)
     if mode == "additional":
         return requested_trials
     raise ValueError(f"Unknown optuna_trials_mode: {mode}")
 
 
-def update_optuna_run_info(completed_before: int | None, remaining_requested: int | None, storage: str | None, study_name: str | None) -> None:
+def update_optuna_run_info(
+    completed_before: int | None,
+    pruned_before: int | None,
+    finished_before: int | None,
+    remaining_requested: int | None,
+    storage: str | None,
+    study_name: str | None,
+) -> None:
     OPTUNA_RUN_INFO.update({
         "optuna_completed_trials_before_run": completed_before,
+        "optuna_pruned_trials_before_run": pruned_before,
+        "optuna_finished_trials_before_run": finished_before,
         "optuna_remaining_trials_requested": remaining_requested,
         "optuna_storage": storage,
         "study_name": study_name,
@@ -450,6 +470,8 @@ def save_experiment_config(config: Dict[str, Any], args: argparse.Namespace, set
             "optuna_trials": args.optuna_trials,
             "optuna_trials_mode": args.optuna_trials_mode,
             "optuna_completed_trials_before_run": OPTUNA_RUN_INFO.get("optuna_completed_trials_before_run"),
+            "optuna_pruned_trials_before_run": OPTUNA_RUN_INFO.get("optuna_pruned_trials_before_run"),
+            "optuna_finished_trials_before_run": OPTUNA_RUN_INFO.get("optuna_finished_trials_before_run"),
             "optuna_remaining_trials_requested": OPTUNA_RUN_INFO.get("optuna_remaining_trials_requested"),
             "optuna_storage": OPTUNA_RUN_INFO.get("optuna_storage") or get_optuna_storage_path(),
             "study_name": OPTUNA_RUN_INFO.get("study_name") or get_study_name(),
@@ -911,37 +933,42 @@ def optimize_hparams(stream_cache: Dict[Tuple[str, float, int], Dict[str, List[i
 
     trial_counts = count_trials_by_state(study)
     completed_trials = trial_counts.get(TrialState.COMPLETE, 0)
+    pruned_trials = trial_counts.get(TrialState.PRUNED, 0)
+    finished_trials = count_finished_optuna_trials(trial_counts)
     running_trials = trial_counts.get(TrialState.RUNNING, 0)
     remaining_trials = compute_remaining_optuna_trials(
-        completed_trials=completed_trials,
+        finished_trials=finished_trials,
         requested_trials=int(ARGS.optuna_trials),
         mode=ARGS.optuna_trials_mode,
     )
-    update_optuna_run_info(completed_trials, remaining_trials, storage, study_name)
+    update_optuna_run_info(completed_trials, pruned_trials, finished_trials, remaining_trials, storage, study_name)
 
     if running_trials:
         print(
             f"[OPTUNA RESUME WARNING] study={study_name} has {running_trials} existing RUNNING trial(s); "
-            "they are not counted toward the COMPLETE target.",
+            "they are not counted toward the finished target.",
             flush=True,
         )
 
     if ARGS.optuna_trials_mode == "target_total":
         if remaining_trials == 0:
             print(
-                f"[OPTUNA RESUME] study={study_name} completed={completed_trials} "
+                f"[OPTUNA RESUME] study={study_name} finished={finished_trials} "
+                f"(complete={completed_trials}, pruned={pruned_trials}) "
                 f"target={int(ARGS.optuna_trials)} remaining=0; skipping optimization.",
                 flush=True,
             )
         else:
             print(
-                f"[OPTUNA RESUME] study={study_name} completed={completed_trials} "
+                f"[OPTUNA RESUME] study={study_name} finished={finished_trials} "
+                f"(complete={completed_trials}, pruned={pruned_trials}) "
                 f"target={int(ARGS.optuna_trials)} remaining={remaining_trials}",
                 flush=True,
             )
     else:
         print(
-            f"[OPTUNA RESUME] study={study_name} completed={completed_trials} "
+            f"[OPTUNA RESUME] study={study_name} finished={finished_trials} "
+            f"(complete={completed_trials}, pruned={pruned_trials}) "
             f"mode=additional requested={int(ARGS.optuna_trials)} remaining={remaining_trials}",
             flush=True,
         )
@@ -950,12 +977,17 @@ def optimize_hparams(stream_cache: Dict[Tuple[str, float, int], Dict[str, List[i
         study.optimize(lambda trial: objective(trial, stream_cache), n_trials=remaining_trials)
 
     final_counts = count_trials_by_state(study)
-    if final_counts.get(TrialState.COMPLETE, 0) == 0:
+    final_completed_trials = final_counts.get(TrialState.COMPLETE, 0)
+    final_pruned_trials = final_counts.get(TrialState.PRUNED, 0)
+    final_finished_trials = count_finished_optuna_trials(final_counts)
+    if final_completed_trials == 0:
         raise ValueError(
             "No completed Optuna trials exist for this study; cannot load best_params. "
-            f"completed=0, requested={int(ARGS.optuna_trials)}, mode={ARGS.optuna_trials_mode}, "
-            f"remaining={remaining_trials}. If target is already satisfied or invalid, increase --optuna_trials "
-            "or use --optuna_trials_mode additional to run new trials."
+            f"complete=0, pruned={final_pruned_trials}, finished={final_finished_trials}, "
+            f"requested={int(ARGS.optuna_trials)}, mode={ARGS.optuna_trials_mode}, "
+            f"remaining={remaining_trials}. Pruned trials count toward the resume target but Optuna "
+            "still needs at least one COMPLETE trial to provide best_params; increase --optuna_trials, "
+            "use --optuna_trials_mode additional, or relax pruning to run new trials."
         )
 
     best_params = dict(study.best_params)
