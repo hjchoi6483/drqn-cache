@@ -1,24 +1,24 @@
 # =========================
-# Python 기본
+# Python defaults
 # =========================
 __pycache__/
 *.py[cod]
 *$py.class
 
-# 가상환경
+# Virtual environments
 .venv/
 venv/
 env/
 
 # =========================
-# PyTorch / 모델 파일
+# PyTorch / model artifacts
 # =========================
 *.pt
 *.pth
 *.ckpt
 
 # =========================
-# 실험 결과
+# Experiment outputs
 # =========================
 out/
 logs/
@@ -39,6 +39,6 @@ results/
 Thumbs.db
 
 # =========================
-# Jupyter (혹시 쓸 경우)
+# Jupyter notebooks
 # =========================
 .ipynb_checkpoints/
