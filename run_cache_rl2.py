@@ -158,7 +158,7 @@ CONFIG = {
     "SCENARIOS": ["zipf"],
 
     # paper-grade baseline set for reporting/comparison
-    "BASELINES": ["lru", "lfu", "lruk", "2q", "arc", "tinylfu", "wtinylfu", "belady"],
+    "BASELINES": ["lru", "lfu", "lruk", "2q", "arc", "tinylfu", "belady"],
 
 
     # training
@@ -313,7 +313,7 @@ def apply_baseline_set(config: Dict[str, Any], baseline_set: str):
     baseline_sets = {
         "minimal": ["lru", "arc"],
         "diverse": ["lru", "lfu", "lruk", "2q", "arc", "tinylfu", "belady"],
-        "paper": ["lru", "lfu", "lruk", "2q", "arc", "tinylfu", "wtinylfu", "belady"],
+        "paper": ["lru", "lfu", "lruk", "2q", "arc", "tinylfu", "belady"],
     }
     if baseline_set not in baseline_sets:
         raise ValueError(f"Unknown baseline set: {baseline_set}")

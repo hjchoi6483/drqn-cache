@@ -127,7 +127,7 @@ Baselines are selected with `--baseline_set`.
 | --- | --- |
 | `minimal` | `lru`, `arc` |
 | `diverse` | `lru`, `lfu`, `lruk`, `2q`, `arc`, `tinylfu`, `belady` |
-| `paper` | `lru`, `lfu`, `lruk`, `2q`, `arc`, `tinylfu`, `wtinylfu`, `belady` |
+| `paper` | `lru`, `lfu`, `lruk`, `2q`, `arc`, `tinylfu`, `belady` |
 
 Implemented policies:
 
@@ -137,7 +137,6 @@ Implemented policies:
 - 2Q (`2q`)
 - Adaptive Replacement Cache (`arc`)
 - TinyLFU (`tinylfu`)
-- Window TinyLFU (`wtinylfu`)
 - Belady's optimal offline policy (`belady`)
 
 Belady receives the full evaluation trace, so it should be interpreted as an offline upper-bound reference rather than an online deployable policy.
