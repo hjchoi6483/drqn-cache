@@ -1,4 +1,6 @@
-# Colab 전용 추가 의존성 (torch는 Colab 기본 제공 버전 우선 사용)
+# Additional dependencies used by the experiment runner.
+# PyTorch is intentionally omitted because Colab and many GPU clusters provide
+# environment-specific CUDA builds.
 numpy>=1.24
 tqdm>=4.66
 optuna>=3.6

@@ -36,8 +36,8 @@ try:
     import torch.optim as optim
 except Exception as e:
     raise RuntimeError(
-        "PyTorch가 필요함. 예) pip install torch\n"
-        f"원인: {repr(e)}"
+        "PyTorch is required. Install it with: pip install torch\n"
+        f"Cause: {repr(e)}"
     )
 
 try:
@@ -45,8 +45,8 @@ try:
     from optuna.trial import TrialState
 except Exception as e:
     raise RuntimeError(
-        "Optuna가 필요함. 예) pip install optuna\n"
-        f"원인: {repr(e)}"
+        "Optuna is required. Install it with: pip install optuna\n"
+        f"Cause: {repr(e)}"
     )
 
 
@@ -55,9 +55,8 @@ except Exception as e:
 # =========================
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--out_dir", type=str, default="out", help="결과 저장 폴더 (기본: ./out)")
-    p.add_argument("--device", type=str, default="cuda", help="cpu | cuda | cuda:0 등 (기본: cuda)")
-    p.add_argument("--use_quick_preset", action="store_true", help="빠른 실험용 축소 프리셋 적용")
+    p.add_argument("--out_dir", type=str, default="out", help="Directory where experiment outputs are written (default: ./out)")
+    p.add_argument("--device", type=str, default="cuda", help="Execution device, e.g., cpu, cuda, or cuda:0 (default: cuda)")
     p.add_argument("--preset", type=str, choices=["quick", "paper_opt", "full"], default="full")
     p.add_argument("--skip_optuna", action="store_true")
     p.add_argument("--best_params_path", type=str, default=None)
@@ -69,15 +68,15 @@ def parse_args():
     p.add_argument("--baseline_set", type=str, choices=["minimal", "diverse", "paper"], default="paper")
     p.add_argument("--study_name", type=str, default=None)
     p.add_argument("--optuna_storage", type=str, default=None)
-    p.add_argument("--optuna_trials", type=int, default=40, help="Optuna trial 횟수/목표 완료 trial 수(COMPLETE+PRUNED, 기본: 40)")
+    p.add_argument("--optuna_trials", type=int, default=40, help="Optuna trial budget or target number of finished trials (COMPLETE+PRUNED; default: 40)")
     p.add_argument(
         "--optuna_trials_mode",
         type=str,
         choices=["target_total", "additional"],
         default="target_total",
         help=(
-            "Optuna trial 해석: target_total=study의 목표 완료 trial 총수(COMPLETE+PRUNED, 기본), "
-            "additional=이번 실행에서 추가로 실행할 trial 수"
+            "Optuna trial semantics: target_total sets the study-wide target number of finished "
+            "trials (COMPLETE+PRUNED, default); additional runs this many new trials in this process."
         ),
     )
     p.add_argument(
@@ -86,8 +85,8 @@ def parse_args():
         choices=["rerun_incomplete", "checkpoint"],
         default="rerun_incomplete",
         help=(
-            "재시작 방식: rerun_incomplete=results.csv에 없는 중단 set은 처음부터 다시 실행(기본), "
-            "checkpoint=ckpt가 있으면 이어서 학습"
+            "Resume policy: rerun_incomplete restarts unfinished runs missing from results.csv (default); "
+            "checkpoint resumes training from an existing checkpoint when available."
         ),
     )
     return p.parse_args()
@@ -109,8 +108,8 @@ def configure_torch_runtime(device_arg: str) -> torch.device:
 
     if wants_cuda and not torch.cuda.is_available():
         raise RuntimeError(
-            "CUDA 장치를 요청했지만 torch.cuda.is_available()가 False입니다. "
-            "CUDA 지원 PyTorch 설치/드라이버 점검 후 다시 실행하세요."
+            "A CUDA device was requested, but torch.cuda.is_available() is False. "
+            "Install a CUDA-enabled PyTorch build and verify the GPU driver before rerunning."
         )
 
     device = torch.device(requested)
@@ -118,8 +117,8 @@ def configure_torch_runtime(device_arg: str) -> torch.device:
     if device.type == "cuda":
         if device.index is not None and device.index >= torch.cuda.device_count():
             raise RuntimeError(
-                f"요청한 CUDA 디바이스 인덱스({device.index})가 유효하지 않습니다. "
-                f"사용 가능한 GPU 개수: {torch.cuda.device_count()}"
+                f"The requested CUDA device index ({device.index}) is invalid. "
+                f"Available GPU count: {torch.cuda.device_count()}"
             )
 
         torch.backends.cudnn.benchmark = True
@@ -131,7 +130,7 @@ def configure_torch_runtime(device_arg: str) -> torch.device:
         dev_idx = device.index if device.index is not None else torch.cuda.current_device()
         print(f"DEVICE: {device} ({torch.cuda.get_device_name(dev_idx)})")
     else:
-        print(f"DEVICE: {device} (경고: GPU 가속 비활성화)")
+        print(f"DEVICE: {device} (warning: GPU acceleration is disabled)")
 
     return device
 
@@ -151,7 +150,7 @@ CONFIG = {
     "NUM_REQUESTS": 1_000_000,
     "TRAIN_RATIO": 0.8,
 
-    # ✅ alpha list (요청)
+    # Zipf alpha grid used by the reported experiments
     "ZIPF_ALPHAS": [1.3, 1.4, 1.5, 1.6, 1.7, 1.8],
 
     # cache sizes / scenarios
@@ -159,7 +158,7 @@ CONFIG = {
     "SCENARIOS": ["zipf"],
 
     # paper-grade baseline set for reporting/comparison
-    "BASELINES": ["lru", "lfu", "lruk", "2q", "arc", "tinylfu", "wtinylfu", "belady"],
+    "BASELINES": ["lru", "lfu", "lruk", "2q", "arc", "tinylfu", "belady"],
 
 
     # training
@@ -221,7 +220,7 @@ def apply_quick_preset(config: Dict[str, Any]):
         "EXPERIMENT_TAG": "quick",
         "NUM_REQUESTS": 250_000,
 
-        # alpha는 요청대로 1.3~1.8 유지
+        # Keep the same alpha grid as the larger experiments
         "ZIPF_ALPHAS": [1.3, 1.4, 1.5, 1.6, 1.7, 1.8],
 
         "CACHE_SIZES": [16, 64],
@@ -239,7 +238,7 @@ def apply_quick_preset(config: Dict[str, Any]):
         "FAST_EVAL_EVERY_EP": 20,
         "FAST_EVAL_STEPS": 5_000,
 
-        # ✅ 학습 중 full eval이 최소 1번은 찍히도록 현실적으로 조정
+        # Ensure at least one full evaluation is emitted during quick training
         "FULL_EVAL_EVERY_EP": 40,
         "FULL_EVAL_STEPS": 20_000,
     })
@@ -314,7 +313,7 @@ def apply_baseline_set(config: Dict[str, Any], baseline_set: str):
     baseline_sets = {
         "minimal": ["lru", "arc"],
         "diverse": ["lru", "lfu", "lruk", "2q", "arc", "tinylfu", "belady"],
-        "paper": ["lru", "lfu", "lruk", "2q", "arc", "tinylfu", "wtinylfu", "belady"],
+        "paper": ["lru", "lfu", "lruk", "2q", "arc", "tinylfu", "belady"],
     }
     if baseline_set not in baseline_sets:
         raise ValueError(f"Unknown baseline set: {baseline_set}")
@@ -322,12 +321,7 @@ def apply_baseline_set(config: Dict[str, Any], baseline_set: str):
 
 
 def apply_cli_filters(config: Dict[str, Any], args: argparse.Namespace):
-    selected_preset = args.preset
-    if args.use_quick_preset:
-        if args.preset != "quick":
-            print("[WARN] --use_quick_preset overrides --preset. Using quick preset.")
-        selected_preset = "quick"
-    apply_preset(config, selected_preset)
+    apply_preset(config, args.preset)
     apply_baseline_set(config, args.baseline_set)
 
     if args.only_alpha is not None:
@@ -1131,7 +1125,7 @@ def build_summary():
 def run_all():
     ensure_dirs()
 
-    # Step 0: stream cache 생성(재사용)
+    # Step 0: build reusable stream cache
     stream_cache = build_stream_cache()
 
     print(f"[BASELINES] {CONFIG['BASELINES']}")
@@ -1156,7 +1150,7 @@ def run_all():
 
     save_experiment_config(CONFIG, ARGS, SETTINGS, used_best_params_path)
 
-    # Step 2: 기존 실험 매트릭스 실행
+    # Step 2: run the configured experiment matrix
     done = load_done_ids()
 
     tasks = []

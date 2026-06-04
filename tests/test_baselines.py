@@ -53,7 +53,7 @@ def main():
     assert ts2["admissions"] == 0.0
     assert ts2["bypasses"] == 0.0
 
-    print("smoke_baselines: ok")
+    print("baseline tests: ok")
 
 
 if __name__ == "__main__":
