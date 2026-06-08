@@ -1,245 +1,309 @@
-# drqn-cache
+# DRQN Cache Replacement Experiments
 
-DRQN 기반 캐시 교체 정책을 학습하고, 고전 알고리즘들과 동일한 요청 트레이스에서 비교 평가하는 실험 러너입니다.
+This repository contains the code used to train and evaluate a Deep Recurrent Q-Network (DRQN) cache replacement policy on synthetic Zipf request traces. The runner compares the learned policy against standard cache replacement baselines under the same traces, cache capacities, and random seeds.
 
-## 핵심 특징
+The repository is intended to be cited from a paper as a reproducible artifact: it provides a single experiment entry point, fixed presets, resumable Optuna tuning, checkpointed training, and CSV summaries for downstream analysis.
 
-- **RL 모델 2종 비교**
-  - `drqn_perslot|G1|P0`
-  - `pooling_lstm|G1|P1`
-- **베이스라인 세트 선택**
-  - `minimal`: `lru`, `arc`
-  - `diverse`: `lru`, `lfu`, `lruk`, `2q`, `arc`, `tinylfu`, `belady`
-  - `paper`: `lru`, `lfu`, `lruk`, `2q`, `arc`, `tinylfu`, `wtinylfu`, `belady`
-- **Optuna 하이퍼파라미터 탐색**
-  - 단일 환경 과적합을 피하기 위해 4개 대표 시나리오 평균 점수 사용
-  - 기본적으로 기존 SQLite study를 불러와 COMPLETE trial 총수가 `--optuna_trials`에 도달할 때까지만 자동 재개
-- **결과 자동 저장**
-  - `results.csv`, `summary.csv`, `best_params.json`, 로그/체크포인트 파일
+## Contents
 
----
+- [Overview](#overview)
+- [Repository structure](#repository-structure)
+- [Installation](#installation)
+- [Quick start](#quick-start)
+- [Experiment presets](#experiment-presets)
+- [Baselines](#baselines)
+- [Hyperparameter tuning](#hyperparameter-tuning)
+- [Outputs](#outputs)
+- [Resuming interrupted runs](#resuming-interrupted-runs)
+- [Reproducing paper-style experiments](#reproducing-paper-style-experiments)
+- [Testing](#testing)
+- [Notes for reviewers](#notes-for-reviewers)
 
-## 저장소 구조
+## Overview
 
-- `run_cache_rl2.py`
-  - 전체 실험 오케스트레이션
-  - Optuna 실행, 학습/평가 루프, 결과 저장
-- `src/models/drqn.py`
-  - `CacheEnv`, Replay 버퍼, DRQN/PoolingLSTM 모델, 학습 유틸
-- `src/workload/zipf.py`
-  - Zipf 요청 트레이스 생성
-- `src/workload/builder.py`
-  - 시나리오별 트레이스 빌더 (`zipf` 지원)
-- `src/baselines/lru.py`
-  - LRU 시뮬레이터
-- `src/baselines/arc.py`
-  - ARC 시뮬레이터 (`T1/T2/B1/B2`, 적응 파라미터 `p`)
-- `src/baselines/factory.py`
-  - 문자열 이름 기반 베이스라인 팩토리
-- `src/evaluation/evaluator.py`
-  - RL/베이스라인 공통 평가 및 캐시
+The main workflow is implemented in `run_cache_rl2.py`:
 
----
+1. Generate Zipf-distributed request streams.
+2. Split each stream into training, fast-evaluation, and full-evaluation segments.
+3. Optionally tune DRQN hyperparameters with Optuna.
+4. Train the recurrent cache policy for every selected scenario, Zipf alpha, cache size, seed, and model setting.
+5. Evaluate the learned policy and all selected baselines on identical request streams.
+6. Write per-run results, aggregate summaries, logs, checkpoints, and experiment metadata.
 
-## 실행 환경
+The current final-release model setting is:
+
+- `drqn_perslot|G1|P0`: a per-cache-slot DRQN policy with global features enabled and invalid-action penalties disabled.
+
+## Repository structure
+
+```text
+.
+├── README.md
+├── requirements-colab.txt
+├── run_cache_rl2.py                # Main experiment runner
+├── scripts/
+│   └── compare_results.py          # Paired comparison utility for result CSV files
+├── src/
+│   ├── baselines/                  # Classical cache replacement policies
+│   ├── evaluation/                 # Shared RL/baseline evaluation logic
+│   ├── models/                     # DRQN environment, replay, networks, and training step
+│   └── workload/                   # Synthetic workload generation
+└── tests/
+    └── test_baselines.py           # Lightweight baseline correctness checks
+```
+
+## Installation
+
+### Local environment
 
 ```bash
 python -m venv .venv
 source .venv/bin/activate
-pip install -U pip
+pip install --upgrade pip
+pip install torch
 pip install -r requirements-colab.txt
 ```
 
----
+Install a CUDA-enabled PyTorch build if you plan to run on a GPU. The requirements file intentionally does not pin PyTorch because the correct package often depends on the CUDA runtime available on the target machine.
 
-## 실행 방법
+### Google Colab or managed GPU environment
 
-### 1) Quick preset
-
-```bash
-python run_cache_rl2.py --out_dir out_quick --device cpu --preset quick --optuna_trials 30
-```
-
-### 2) Paper-opt preset
+Colab usually provides PyTorch already. In that case, install only the additional dependencies:
 
 ```bash
-python run_cache_rl2.py --out_dir out_paper --device cpu --preset paper_opt --optuna_trials 40
+pip install -r requirements-colab.txt
 ```
 
-### 3) Full run
+## Quick start
 
-```bash
-python run_cache_rl2.py --out_dir out_full --device cpu --preset full --optuna_trials 40
-```
-
-> GPU 사용 시 `--device cuda` 또는 `--device cuda:0` 지정.
-
-### 중단 후 재시작
-
-기본 재시작 방식은 `--resume_mode rerun_incomplete`입니다. 같은 `--out_dir`로 다시 실행하면 `results.csv`에 최종 결과 행이 있는 완료 set은 건너뛰고, 결과 행 없이 중간에 멈춘 set은 기존 체크포인트/로그를 `incomplete_archive/`로 옮긴 뒤 처음부터 다시 실행합니다.
+Run a small CPU job to verify that the pipeline starts correctly:
 
 ```bash
 python run_cache_rl2.py \
-  --out_dir out_full \
+  --out_dir out_quick \
   --device cpu \
-  --preset full \
+  --preset quick \
   --skip_optuna \
-  --resume_mode rerun_incomplete
+  --baseline_set minimal \
+  --only_alpha 1.3 \
+  --only_cache 16 \
+  --seeds 0
 ```
 
-중간 체크포인트에서 이어서 학습하고 싶다면 `--resume_mode checkpoint`를 사용합니다.
+For GPU execution, use `--device cuda` or a specific device such as `--device cuda:0`.
+
+## Experiment presets
+
+The runner supports three presets through `--preset`.
+
+| Preset | Intended use | Request count | Seeds | Training episodes | Evaluation size |
+| --- | --- | ---: | --- | ---: | --- |
+| `quick` | Fast development and sanity checks | 250,000 | `0,1` | 80 | reduced fast/full evaluation |
+| `paper_opt` | Practical paper-oriented sweep | 500,000 | `0,1,2,3,4` | 160 | intermediate evaluation |
+| `full` | Largest default run | 1,000,000 | `0` | 400 | largest default evaluation |
+
+The default workload grid uses:
+
+- Scenario: `zipf`
+- Zipf alpha values: `1.3, 1.4, 1.5, 1.6, 1.7, 1.8`
+- Cache sizes: `16, 64`
+- Vocabulary size: `10,000`
+- Train/test split: `80% / 20%`
+
+You can restrict a run with:
+
+```bash
+--only_alpha 1.3,1.8
+--only_cache 16
+--seeds 0,1,2
+--only_algo drqn_perslot
+```
+
+## Baselines
+
+Baselines are selected with `--baseline_set`.
+
+| Set | Policies |
+| --- | --- |
+| `minimal` | `lru`, `arc` |
+| `diverse` | `lru`, `lfu`, `lruk`, `2q`, `arc`, `tinylfu`, `belady` |
+| `paper` | `lru`, `lfu`, `lruk`, `2q`, `arc`, `tinylfu`, `belady` |
+
+Implemented policies:
+
+- Least Recently Used (`lru`)
+- Least Frequently Used (`lfu`)
+- LRU-K with `k=2` (`lruk`)
+- 2Q (`2q`)
+- Adaptive Replacement Cache (`arc`)
+- TinyLFU (`tinylfu`)
+- Belady's optimal offline policy (`belady`)
+
+Belady receives the full evaluation trace, so it should be interpreted as an offline upper-bound reference rather than an online deployable policy.
+
+## Hyperparameter tuning
+
+Optuna tuning is enabled by default. Disable it with `--skip_optuna` when you want to use the configuration values already in `run_cache_rl2.py` or load a parameter JSON file.
 
 ```bash
 python run_cache_rl2.py \
-  --out_dir out_full \
-  --device cpu \
-  --preset full \
-  --skip_optuna \
-  --resume_mode checkpoint
-```
-
----
-
-## 기본 설정(코드 기준)
-
-`run_cache_rl2.py`의 기본값은 아래와 같습니다.
-
-- 요청 수: `1,000,000`
-- Zipf alpha: `[1.3, 1.4, 1.5, 1.6, 1.7, 1.8]`
-- 캐시 크기: `[16, 64]`
-- 시나리오: `zipf`
-- seed: `[0]`
-- 학습 에피소드: 최대 `400`
-
-Quick preset(`--preset quick`, legacy `--use_quick_preset`) 적용 시:
-
-- 요청 수: `250,000`
-- seed: `[0, 1]`
-- 학습/평가 스텝 축소 (빠른 smoke + 트렌드 확인용)
-
-Paper-opt preset(`--preset paper_opt`) 적용 시:
-
-- 요청 수: `500,000`
-- seed: `[0, 1, 2, 3, 4]`
-- 학습/평가를 full보다 가볍게 유지하면서 quick보다 안정적인 비교용 설정
-
----
-
-## Optuna objective 설계
-
-튜닝 프로파일(`--tuning_profile`)에 따라 대표 그리드를 다르게 사용합니다.
-
-- `quick`: alpha `[1.3, 1.8]`, cache `[16, 64]`, seed 1개
-- `paper`: alpha `[1.3, 1.5, 1.8]`, cache `[16, 64]`, seed 1개
-- `robust`: alpha `[1.3, 1.5, 1.8]`, cache `[16, 64]`, seed 최대 2개
-
-objective는 `0.8 * mean(scores) + 0.2 * min(scores)`를 사용해 평균 성능과 hard case 안정성을 함께 반영합니다.
-
-### Optuna 자동 재개 동작
-
-기본 Optuna storage는 기존과 동일하게 `sqlite:///{OUT_DIR}/optuna_{EXPERIMENT_TAG}_{tuning_profile}.db`이며, study는 `load_if_exists=True`로 불러옵니다. 따라서 같은 `--out_dir`, `--preset`, `--tuning_profile`, `--only_algo`/stage 조합을 다시 실행하면 이전 study를 이어서 사용합니다.
-
-기본값인 `--optuna_trials_mode target_total`에서는 `--optuna_trials`가 **이번 실행에서 새로 추가할 trial 수**가 아니라 **study 안의 목표 COMPLETE trial 총수**를 의미합니다. 예를 들어 첫 실행이 25개의 COMPLETE trial 이후 중단되었고 같은 명령을 `--optuna_trials 40`으로 다시 실행하면, 러너는 자동으로 남은 15개만 요청해 총 40개 COMPLETE trial까지 채웁니다. 이미 40개 이상의 COMPLETE trial이 있으면 optimization을 건너뛰고 기존 `study.best_params`를 사용합니다. PRUNED/FAIL/RUNNING trial은 목표 COMPLETE trial 수에 포함하지 않으며, 기존 RUNNING trial이 있으면 경고만 출력하고 삭제하지 않습니다.
-
-의도적으로 매 실행마다 trial을 더 추가하고 싶다면 예전 동작과 같은 `--optuna_trials_mode additional`을 지정합니다. 이 모드에서 `--optuna_trials 40`은 현재 COMPLETE trial 수와 무관하게 이번 프로세스에서 40개 trial을 추가로 요청합니다.
-
-Colab에서 중단 후 자동 재개를 활용하는 예시:
-
-```bash
-python run_cache_rl2.py \
-  --out_dir /content/drive/MyDrive/drqn-cache-results/out_paper_opt_resume \
+  --out_dir out_paper \
   --device cuda \
   --preset paper_opt \
   --tuning_profile paper \
   --optuna_trials 40 \
-  --baseline_set minimal \
-  --only_algo drqn_perslot \
-  --resume_mode rerun_incomplete
+  --baseline_set paper
 ```
 
-탐색 파라미터:
+Tuning profiles define the representative grid used inside the Optuna objective:
 
-- `LR`: `3e-5 ~ 8e-4` (log)
-- `GAMMA`: `0.92 ~ 0.995`
-- `UNROLL`: `[30, 40, 60, 80]`
-- `BATCH_SIZE`: `[16, 32, 64]`
-- `TARGET_UPDATE_EVERY_UPDATES`: `[200, 500, 1000]`
-- `UPDATES_PER_EPISODE`: `[8, 12, 16]`
-- `EPSILON_DECAY_STEPS`: `[100000, 200000, 300000]`
+| Profile | Alpha values | Cache sizes | Seeds |
+| --- | --- | --- | --- |
+| `quick` | `1.3, 1.8` | `16, 64` | first configured seed |
+| `paper` | `1.3, 1.5, 1.8` | `16, 64` | first configured seed |
+| `robust` | `1.3, 1.5, 1.8` | `16, 64` | up to two configured seeds |
 
----
+The objective balances average and difficult-case performance:
 
-## 출력 파일
-
-- `OUT_DIR/best_params.json`: Optuna 최고 파라미터
-- `OUT_DIR/experiment_config.json`: 실행 메타데이터/최종 CONFIG/CLI 인자/깃 정보 및 Optuna 재개 메타데이터(`optuna_trials`, `optuna_trials_mode`, `optuna_completed_trials_before_run`, `optuna_remaining_trials_requested`, `optuna_storage`, `study_name`)
-- `OUT_DIR/results.csv`: run-level 결과
-- `OUT_DIR/summary.csv`: 그룹 집계 결과
-- `OUT_DIR/summary_overall.csv`
-- `OUT_DIR/summary_by_cache.csv`
-- `OUT_DIR/summary_by_alpha.csv`
-- `OUT_DIR/summary_hard_conditions.csv`
-- `OUT_DIR/summary_belady_gap.csv`
-- `OUT_DIR/logs/*.jsonl`: 에피소드 로그
-- `OUT_DIR/ckpt/*.pt`: 모델 체크포인트
-
----
-
-## 코드 리뷰 기준 확인 포인트
-
-전체 코드 기준으로 아래 사항이 보장되도록 구성되어 있습니다.
-
-1. **베이스라인 공정성**
-   - RL과 LRU/ARC 모두 동일 `test_stream`으로 평가
-2. **중복 계산 최소화**
-   - 베이스라인 결과는 `(scenario, alpha, cache_size, eval_kind, names)` 키로 캐시
-3. **안전한 디바이스 설정**
-   - CUDA 요청 시 사용 가능 여부/인덱스 유효성 검사
-4. **행동 제약 일관성**
-   - `valid_action_mask`로 hit/empty 상태에서 `NOOP`만 유효하게 처리
-
-## Experiment control quick guide
-
-### Quick smoke run
-```bash
-python run_cache_rl2.py \
-  --preset quick \
-  --only_alpha 1.3 \
-  --only_cache 16 \
-  --seeds 0 \
-  --only_algo drqn_perslot \
-  --baseline_set minimal \
-  --skip_optuna \
-  --out_dir out_smoke_cleanup \
-  --device cpu
+```text
+objective = 0.8 * mean(scores) + 0.2 * min(scores)
 ```
 
-### Lightweight Optuna tuning run
-```bash
-python run_cache_rl2.py \
-  --out_dir /content/out_tune_light_two_stage \
-  --device cuda \
-  --preset quick \
-  --tuning_profile quick \
-  --optuna_trials 10 \
-  --baseline_set minimal \
-  --only_algo drqn_perslot
+By default, Optuna storage is written to:
+
+```text
+{OUT_DIR}/optuna_{EXPERIMENT_TAG}_{tuning_profile}.db
 ```
 
-### Fixed best_params paper_opt run
+The corresponding best parameters are saved as:
+
+```text
+{OUT_DIR}/best_params.json
+```
+
+To reuse parameters without running Optuna:
+
 ```bash
 python run_cache_rl2.py \
-  --out_dir /content/drive/MyDrive/drqn-cache-results/out_paper_two_stage_fixed \
+  --out_dir out_eval \
   --device cuda \
   --preset paper_opt \
   --skip_optuna \
-  --best_params_path /content/drive/MyDrive/drqn-cache-results/out_tune_light_two_stage/best_params.json \
-  --baseline_set paper \
-  --only_algo drqn_perslot \
-  --seeds 0,1,2,3,4
+  --best_params_path out_paper/best_params.json
 ```
 
-### Notes
-- Prefer local `/content` during Optuna tuning to reduce Google Drive I/O overhead.
-- Copy `best_params.json` to Drive after tuning.
-- Use Drive `out_dir` for long persistence-focused final runs.
+## Outputs
+
+Each run writes the following files under `--out_dir`:
+
+| Path | Description |
+| --- | --- |
+| `results.csv` | One row per completed experiment run, including RL hit rate and baseline hit rates. |
+| `summary.csv` | Aggregated means and standard deviations grouped by scenario, alpha, cache size, and setting. |
+| `summary_overall.csv` | Overall aggregation by experiment setting and algorithm. |
+| `summary_by_cache.csv` | Aggregation by cache size. |
+| `summary_by_alpha.csv` | Aggregation by Zipf alpha. |
+| `summary_hard_conditions.csv` | Aggregation for harder conditions, currently low alpha and small cache. |
+| `summary_belady_gap.csv` | Gap between the learned policy and Belady when Belady is enabled. |
+| `experiment_config.json` | Final configuration, CLI arguments, Git branch/commit, Optuna metadata, and timestamp. |
+| `best_params.json` | Best Optuna parameters when tuning is enabled. |
+| `logs/` | Per-run training logs. |
+| `ckpt/` | Per-run checkpoints. |
+| `incomplete_archive/` | Archived stale artifacts when interrupted runs are restarted. |
+
+A separate paired-comparison utility is available for comparing two result files:
+
+```bash
+python scripts/compare_results.py \
+  --a path/to/run_a/results.csv \
+  --b path/to/run_b/results.csv \
+  --metric rl_hit
+```
+
+## Resuming interrupted runs
+
+Completed runs are detected from finalized rows in `results.csv`. If a run is missing a completed result row, the default resume behavior is to archive stale log/checkpoint artifacts and restart that run from episode 0:
+
+```bash
+python run_cache_rl2.py \
+  --out_dir out_paper \
+  --device cuda \
+  --preset paper_opt \
+  --resume_mode rerun_incomplete
+```
+
+To continue from an existing checkpoint instead, use:
+
+```bash
+python run_cache_rl2.py \
+  --out_dir out_paper \
+  --device cuda \
+  --preset paper_opt \
+  --resume_mode checkpoint
+```
+
+Optuna also supports resumable studies. With the default `--optuna_trials_mode target_total`, `--optuna_trials` means the target number of finished trials in the study, counting both COMPLETE and PRUNED trials. For example, if 25 trials are already finished and you rerun with `--optuna_trials 40`, the runner requests only 15 additional trials. Use `--optuna_trials_mode additional` if every invocation should launch the requested number of new trials regardless of existing study state.
+
+## Reproducing paper-style experiments
+
+A practical paper-style command is:
+
+```bash
+python run_cache_rl2.py \
+  --out_dir out_paper_opt \
+  --device cuda \
+  --preset paper_opt \
+  --tuning_profile paper \
+  --optuna_trials 40 \
+  --baseline_set paper \
+  --resume_mode rerun_incomplete
+```
+
+For deterministic evaluation using a previously tuned configuration:
+
+```bash
+python run_cache_rl2.py \
+  --out_dir out_paper_eval \
+  --device cuda \
+  --preset paper_opt \
+  --skip_optuna \
+  --best_params_path out_paper_opt/best_params.json \
+  --baseline_set paper \
+  --resume_mode rerun_incomplete
+```
+
+For a smaller reviewer-run subset:
+
+```bash
+python run_cache_rl2.py \
+  --out_dir out_reviewer_subset \
+  --device cpu \
+  --preset quick \
+  --skip_optuna \
+  --baseline_set diverse \
+  --only_alpha 1.3,1.8 \
+  --only_cache 16 \
+  --seeds 0
+```
+
+## Testing
+
+Run the lightweight baseline checks with:
+
+```bash
+python tests/test_baselines.py
+```
+
+Run a syntax check for all Python modules with:
+
+```bash
+python -m compileall -q .
+```
+
+## Notes for reviewers
+
+- The main reported metric is hit rate percentage. For each run, `results.csv` includes `rl_hit`, `baseline_hit_{name}`, and `rl_minus_baseline_{name}` columns.
+- Belady is computed offline with access to the full evaluation stream; it is included as an upper-bound reference.
+- The workload generator currently supports Zipf traces only. The modular workload interface is in `src/workload/builder.py` if additional scenarios are needed.
+- Checkpoints include model weights, optimizer state, replay contents, and training state so that long runs can be resumed.
+- `experiment_config.json` records the Git branch and commit, making it easier to match results to the exact code revision used for an experiment.
