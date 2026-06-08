@@ -307,3 +307,84 @@ python -m compileall -q .
 - The workload generator currently supports Zipf traces only. The modular workload interface is in `src/workload/builder.py` if additional scenarios are needed.
 - Checkpoints include model weights, optimizer state, replay contents, and training state so that long runs can be resumed.
 - `experiment_config.json` records the Git branch and commit, making it easier to match results to the exact code revision used for an experiment.
+
+## YCSB-style trace workloads
+
+The runner can also evaluate the existing two-stage TinyLFU-assisted `DRQN_PerSlot` policy on YCSB-core-style trace models. These traces are **cache workload traces**, not real database benchmark executions: the generator emits operation records and the loader converts read-bearing operations into the integer request stream consumed by the existing simulator and baselines.
+
+### Supported workloads
+
+| Workload | Operation mix | Access distribution | Cache metric mapping |
+| --- | --- | --- | --- |
+| YCSB-C | `READ` 100% | Zipfian | Every operation is a cache lookup and counts toward read hit rate. |
+| YCSB-B | `READ` 95%, `UPDATE` 5% | Zipfian | `READ` counts toward read hit rate; `UPDATE` is retained in the trace but excluded from cache lookup metrics. |
+| YCSB-A | `READ` 50%, `UPDATE` 50% | Zipfian | `READ` counts toward read hit rate; `UPDATE` is not counted. |
+| YCSB-F | `READ` 50%, `READ_MODIFY_WRITE` 50% | Zipfian | Both operations include reads, so both are cache lookups and count toward read hit rate. |
+| YCSB-D | `READ` 95%, `INSERT` 5% | Latest-style reads | `INSERT` creates new keys; subsequent reads are biased toward recently inserted keys. Inserts are not counted in read hit rate. |
+
+YCSB-E is intentionally excluded for now because scans/range reads require a range-aware simulator interface and range-aware baselines. TODO: add scan/range access support before enabling YCSB-E.
+
+### Generate traces directly
+
+Trace generation is deterministic under a fixed `--seed` and writes JSONL records with `index`, `timestep`, `operation`, `key`, `is_cache_lookup`, and `count_read_hit_rate` fields. A sidecar `.meta.json` records the workload name, record count, operation count, seed, and Zipf/latest skew.
+
+```bash
+python -m src.workload.ycsb.generate_ycsb_trace \
+  --workload C \
+  --recordcount 1000 \
+  --operationcount 5000 \
+  --seed 0 \
+  --out out/traces/ycsb_C_records1000_ops5000_seed0.jsonl
+```
+
+### Run quick YCSB experiments
+
+YCSB-C quick smoke experiment:
+
+```bash
+python run_cache_rl2.py \
+  --out_dir out_ycsb_c_quick \
+  --device cpu \
+  --preset paper_ycsb_quick \
+  --workload_source ycsb \
+  --ycsb_workload C \
+  --recordcount 1000 \
+  --operationcount 5000 \
+  --cache_size 32 \
+  --seed 0 \
+  --skip_optuna \
+  --baseline_set minimal
+```
+
+YCSB-D quick smoke experiment:
+
+```bash
+python run_cache_rl2.py \
+  --out_dir out_ycsb_d_quick \
+  --device cpu \
+  --preset paper_ycsb_quick \
+  --workload_source ycsb \
+  --ycsb_workload D \
+  --recordcount 1000 \
+  --operationcount 5000 \
+  --cache_size 32 \
+  --seed 0 \
+  --skip_optuna \
+  --baseline_set minimal
+```
+
+The YCSB loader filters evaluation streams to read-bearing cache lookup events before computing `read_hit_rate`, baseline hit rates, and Belady. UPDATE and INSERT-only operations are therefore excluded from the Belady request sequence unless write-allocate behavior is added later.
+
+### Existing synthetic Zipf compatibility smoke command
+
+```bash
+python run_cache_rl2.py \
+  --out_dir out_zipf_smoke \
+  --device cpu \
+  --preset quick \
+  --skip_optuna \
+  --baseline_set minimal \
+  --only_alpha 1.3 \
+  --only_cache 16 \
+  --seeds 0
+```
