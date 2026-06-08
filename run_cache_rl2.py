@@ -57,7 +57,7 @@ def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--out_dir", type=str, default="out", help="Directory where experiment outputs are written (default: ./out)")
     p.add_argument("--device", type=str, default="cuda", help="Execution device, e.g., cpu, cuda, or cuda:0 (default: cuda)")
-    p.add_argument("--preset", type=str, choices=["quick", "paper_opt", "full"], default="full")
+    p.add_argument("--preset", type=str, choices=["quick", "paper_opt", "full", "paper_ycsb_quick", "paper_ycsb"], default="full")
     p.add_argument("--skip_optuna", action="store_true")
     p.add_argument("--best_params_path", type=str, default=None)
     p.add_argument("--tuning_profile", type=str, choices=["quick", "paper", "robust"], default="paper")
@@ -65,6 +65,7 @@ def parse_args():
     p.add_argument("--only_alpha", type=str, default=None)
     p.add_argument("--only_cache", type=str, default=None)
     p.add_argument("--seeds", type=str, default=None)
+    p.add_argument("--seed", type=int, default=None, help="Single seed alias for --seeds.")
     p.add_argument("--baseline_set", type=str, choices=["minimal", "diverse", "paper"], default="paper")
     p.add_argument("--study_name", type=str, default=None)
     p.add_argument("--optuna_storage", type=str, default=None)
@@ -89,6 +90,14 @@ def parse_args():
             "checkpoint resumes training from an existing checkpoint when available."
         ),
     )
+    p.add_argument("--workload_source", type=str, choices=["synthetic", "ycsb"], default="synthetic")
+    p.add_argument("--ycsb_workload", type=str, choices=["A", "B", "C", "D", "F"], default="C")
+    p.add_argument("--trace_path", type=str, default=None, help="Optional YCSB JSONL trace path. If omitted, the runner generates one deterministically.")
+    p.add_argument("--recordcount", type=int, default=None, help="Initial YCSB key universe size.")
+    p.add_argument("--operationcount", type=int, default=None, help="YCSB operation count before filtering to cache lookup events.")
+    p.add_argument("--zipf_alpha", type=float, default=None, help="Zipf/latest skew for YCSB generation.")
+    p.add_argument("--cache_ratio", type=float, default=None, help="Set cache size to round(recordcount * cache_ratio) for YCSB runs.")
+    p.add_argument("--cache_size", type=int, default=None, help="Set one cache size directly; aliases --only_cache for convenience.")
     return p.parse_args()
 
 ARGS = parse_args()
@@ -207,6 +216,11 @@ CONFIG = {
     # seeds
     "SEEDS": [0],
 
+    # workload source / YCSB trace-model options
+    "WORKLOAD_SOURCE": "synthetic",
+    "YCSB_WORKLOAD": "C",
+    "TRACE_PATH": None,
+
     # checkpoint / resume
     "SAVE_CKPT": True,
     "SAVE_CKPT_EVERY_EP": 5,
@@ -265,11 +279,51 @@ def apply_paper_opt_preset(config: Dict[str, Any]):
     })
 
 
+def apply_paper_ycsb_quick_preset(config: Dict[str, Any]):
+    config.update({
+        "EXPERIMENT_TAG": "paper_ycsb_quick",
+        "WORKLOAD_SOURCE": "ycsb",
+        "NUM_REQUESTS": 5_000,
+        "VOCAB_SIZE": 1_000,
+        "ZIPF_ALPHAS": [1.2],
+        "CACHE_SIZES": [32],
+        "SCENARIOS": ["ycsb_C"],
+        "SEEDS": [0],
+        "EPISODE_LEN": 200,
+        "MAX_TRAIN_EPISODES": 2,
+        "REPLAY_MAX_EPISODES": 20,
+        "START_TRAIN_AFTER_EPISODES": 10,
+        "UPDATES_PER_EPISODE": 0,
+        "FAST_EVAL_EVERY_EP": 1,
+        "FAST_EVAL_STEPS": 500,
+        "FULL_EVAL_EVERY_EP": 1,
+        "FULL_EVAL_STEPS": 1_000,
+        "SAVE_CKPT": False,
+    })
+
+
+def apply_paper_ycsb_preset(config: Dict[str, Any]):
+    config.update({
+        "EXPERIMENT_TAG": "paper_ycsb",
+        "WORKLOAD_SOURCE": "ycsb",
+        "NUM_REQUESTS": 1_000_000,
+        "VOCAB_SIZE": 100_000,
+        "ZIPF_ALPHAS": [1.2],
+        "CACHE_SIZES": [1_000, 10_000],
+        "SCENARIOS": ["ycsb_A", "ycsb_B", "ycsb_C", "ycsb_D", "ycsb_F"],
+        "SEEDS": [0, 1, 2, 3, 4],
+    })
+
+
 def apply_preset(config: Dict[str, Any], preset_name: str):
     if preset_name == "quick":
         apply_quick_preset(config)
     elif preset_name == "paper_opt":
         apply_paper_opt_preset(config)
+    elif preset_name == "paper_ycsb_quick":
+        apply_paper_ycsb_quick_preset(config)
+    elif preset_name == "paper_ycsb":
+        apply_paper_ycsb_preset(config)
     elif preset_name == "full":
         config["EXPERIMENT_TAG"] = "full"
     else:
@@ -328,8 +382,34 @@ def apply_cli_filters(config: Dict[str, Any], args: argparse.Namespace):
         config["ZIPF_ALPHAS"] = _parse_csv_numbers(args.only_alpha, float, "alpha")
     if args.only_cache is not None:
         config["CACHE_SIZES"] = _parse_csv_numbers(args.only_cache, int, "cache_size")
+    if args.cache_size is not None:
+        config["CACHE_SIZES"] = [int(args.cache_size)]
     if args.seeds is not None:
         config["SEEDS"] = _parse_csv_numbers(args.seeds, int, "seed")
+    if args.seed is not None:
+        config["SEEDS"] = [int(args.seed)]
+
+    preset_requested_ycsb = str(config.get("WORKLOAD_SOURCE", "synthetic")) == "ycsb"
+    cli_requested_ycsb = args.workload_source == "ycsb"
+    if cli_requested_ycsb or preset_requested_ycsb:
+        config["WORKLOAD_SOURCE"] = "ycsb"
+        config["YCSB_WORKLOAD"] = args.ycsb_workload
+        config["TRACE_PATH"] = args.trace_path
+        if cli_requested_ycsb:
+            config["SCENARIOS"] = [f"ycsb_{args.ycsb_workload}"]
+        if args.recordcount is not None:
+            config["VOCAB_SIZE"] = int(args.recordcount)
+        if args.operationcount is not None:
+            config["NUM_REQUESTS"] = int(args.operationcount)
+        if args.zipf_alpha is not None:
+            config["ZIPF_ALPHAS"] = [float(args.zipf_alpha)]
+        elif not str(config.get("EXPERIMENT_TAG", "")).startswith("paper_ycsb"):
+            config["ZIPF_ALPHAS"] = [1.2]
+        if args.cache_ratio is not None:
+            config["CACHE_SIZES"] = [max(1, int(round(int(config["VOCAB_SIZE"]) * float(args.cache_ratio))))]
+    else:
+        config["WORKLOAD_SOURCE"] = "synthetic"
+        config["TRACE_PATH"] = None
 
     global SETTINGS
     if args.only_algo is not None:
@@ -346,6 +426,11 @@ apply_cli_filters(CONFIG, ARGS)
 # =========================
 def run_id(scenario: str, alpha: float, cache_size: int, seed: int, s: Setting) -> str:
     tag = str(CONFIG.get("EXPERIMENT_TAG", "default"))
+    if str(CONFIG.get("WORKLOAD_SOURCE", "synthetic")) == "ycsb":
+        return (
+            f"{tag}_{scenario}_records{int(CONFIG['VOCAB_SIZE'])}_ops{int(CONFIG['NUM_REQUESTS'])}"
+            f"_a{alpha}_S{cache_size}_seed{seed}_{setting_name(s)}"
+        )
     return f"{tag}_{scenario}_a{alpha}_S{cache_size}_seed{seed}_{setting_name(s)}"
 
 def safe_filename(s: str) -> str:
@@ -799,6 +884,11 @@ def train_one_run(
         "final_loss_tail_mean": float(np.mean(st.loss_tail[-1000:])) if st.loss_tail else 0.0,
 
         "rl_hit": float(final["rl_hit"]),
+        "read_hit_rate": float(final.get("read_hit_rate", final["rl_hit"])),
+        "total_lookup_hit_rate": float(final.get("total_lookup_hit_rate", final["rl_hit"])),
+        "admission_rate": float(final.get("admission_rate", 0.0)),
+        "eviction_count": int(final.get("eviction_count", 0.0)),
+        "lookup_count": int(final.get("lookup_count", 0.0)),
         "wall_sec": float(time.time() - t0),
     }
 
@@ -833,9 +923,15 @@ def build_stream_cache() -> Dict[Tuple[str, float, int], Dict[str, List[int]]]:
 
 
 def get_tuning_grid(config: Dict[str, Any], profile: str) -> List[Tuple[str, float, int, int]]:
+    seeds = config["SEEDS"][:1] if profile in {"quick", "paper"} else (config["SEEDS"][:2] if len(config["SEEDS"]) >= 2 else config["SEEDS"][:1])
+    if str(config.get("WORKLOAD_SOURCE", "synthetic")) == "ycsb":
+        scenarios = list(config["SCENARIOS"])[:1] if profile == "quick" else list(config["SCENARIOS"])
+        alphas = list(config["ZIPF_ALPHAS"])[:1]
+        caches = list(config["CACHE_SIZES"])[:1 if profile == "quick" else len(config["CACHE_SIZES"])]
+        return [(str(sc), float(a), int(c), int(seed)) for sc in scenarios for a in alphas for c in caches for seed in seeds]
+
     alphas = [1.3, 1.8] if profile == "quick" else [1.3, 1.5, 1.8]
     caches = [16, 64]
-    seeds = config["SEEDS"][:1] if profile in {"quick", "paper"} else (config["SEEDS"][:2] if len(config["SEEDS"]) >= 2 else config["SEEDS"][:1])
     out = []
     for a in alphas:
         for c in caches:

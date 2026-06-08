@@ -74,17 +74,25 @@ def evaluate_policy_with_baselines(
     # RL hit rate is based on env.step() hit boolean; bypass is a miss by definition.
     rl_hits = 0
     rl_miss = 0
+    admissions = 0
+    evictions = 0
     for req in test_stream:
         obs = make_obs_fn(env, req)
         a, hidden = select_action_fn(model, obs, hidden, eps=0.0)
         _r, hit = env.step(req, a)
+        step_info = getattr(env, "last_step_info", {})
         if hit:
             rl_hits += 1
         else:
             rl_miss += 1
+            if step_info.get("admit", False):
+                admissions += 1
+            if step_info.get("evict", False):
+                evictions += 1
 
     total = rl_hits + rl_miss
     rl_hit = (rl_hits / total) * 100.0 if total else 0.0
+    admission_rate = admissions / max(1, rl_miss)
 
     baseline_res = compute_baselines_once(
         scenario=scenario,
@@ -97,7 +105,15 @@ def evaluate_policy_with_baselines(
         build_baselines_fn=build_baselines_fn,
     )
 
-    out = {"rl_hit": float(rl_hit)}
+    out = {
+        "rl_hit": float(rl_hit),
+        "read_hit_rate": float(rl_hit),
+        "total_lookup_hit_rate": float(rl_hit),
+        "admission_rate": float(admission_rate),
+        "eviction_count": float(evictions),
+        "lookup_count": float(total),
+        "read_lookup_count": float(total),
+    }
     out.update(baseline_res)
     for name in baseline_names:
         hit = baseline_res.get(f"baseline_hit_{name}", 0.0)
