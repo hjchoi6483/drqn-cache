@@ -11,6 +11,7 @@ The repository is intended to be cited from a paper as a reproducible artifact: 
 - [Installation](#installation)
 - [Quick start](#quick-start)
 - [Experiment presets](#experiment-presets)
+- [Extended workloads (non-stationary and YCSB)](#extended-workloads-non-stationary-and-ycsb)
 - [Baselines](#baselines)
 - [Hyperparameter tuning](#hyperparameter-tuning)
 - [Outputs](#outputs)
@@ -47,9 +48,10 @@ The current final-release model setting is:
 │   ├── baselines/                  # Classical cache replacement policies
 │   ├── evaluation/                 # Shared RL/baseline evaluation logic
 │   ├── models/                     # DRQN environment, replay, networks, and training step
-│   └── workload/                   # Synthetic workload generation
+│   └── workload/                   # Synthetic workload generation (zipf, nonstationary, ycsb)
 └── tests/
-    └── test_baselines.py           # Lightweight baseline correctness checks
+    ├── test_baselines.py           # Lightweight baseline correctness checks
+    └── test_workloads.py           # Workload generator sanity checks
 ```
 
 ## Installation
@@ -94,12 +96,13 @@ For GPU execution, use `--device cuda` or a specific device such as `--device cu
 
 ## Experiment presets
 
-The runner supports three presets through `--preset`.
+The runner supports four presets through `--preset`.
 
 | Preset | Intended use | Request count | Seeds | Training episodes | Evaluation size |
 | --- | --- | ---: | --- | ---: | --- |
 | `quick` | Fast development and sanity checks | 250,000 | `0,1` | 80 | reduced fast/full evaluation |
 | `paper_opt` | Practical paper-oriented sweep | 500,000 | `0,1,2,3,4` | 160 | intermediate evaluation |
+| `paper_ext` | Extended workloads (non-stationary + YCSB) | 500,000 | `0,1,2,3,4` | 160 | intermediate evaluation |
 | `full` | Largest default run | 1,000,000 | `0` | 400 | largest default evaluation |
 
 The default workload grid uses:
@@ -110,6 +113,10 @@ The default workload grid uses:
 - Vocabulary size: `10,000`
 - Train/test split: `80% / 20%`
 
+The `paper_ext` preset instead runs the extended scenarios `shift`, `hotshift`,
+`ycsb_a`, `ycsb_b`, `ycsb_c`, and `ycsb_d` (see
+[Extended workloads](#extended-workloads-non-stationary-and-ycsb)).
+
 You can restrict a run with:
 
 ```bash
@@ -117,7 +124,99 @@ You can restrict a run with:
 --only_cache 16
 --seeds 0,1,2
 --only_algo drqn_perslot
+--only_scenario ycsb_d        # restrict the scenario grid (replaces preset SCENARIOS)
 ```
+
+## Extended workloads (non-stationary and YCSB)
+
+Beyond the stationary `zipf` scenario, the runner provides two additional
+workload families so the learned policy can be evaluated outside a single
+stationary synthetic distribution. All extended scenarios emit the same
+fixed-size integer key stream (ids in `1..VOCAB_SIZE`, never `0`) consumed by the
+existing simulator, and every trace is a deterministic function of
+`(scenario, alpha, seed)`.
+
+### Experiment C — non-stationary synthetic workloads
+
+| Scenario | Description | Alpha slot |
+| --- | --- | --- |
+| `shift` | The request distribution's Zipf skew changes once, partway through the stream. The early stationary regime covers training; the skew change lands inside the evaluation portion. | start skew (e.g. `1.3`); the end skew is `SHIFT_ALPHA_TO` |
+| `hotshift` | The Zipf shape is held fixed, but the rank→key mapping is rotated by a fresh permutation every `HOTSHIFT_PERIOD` requests, so *which* concrete keys are hot drifts over time (a changing working set). | Zipf shape skew (e.g. `1.3`) |
+
+The relevant `CONFIG` knobs are `SHIFT_ALPHA_TO` (default `1.8`), `SHIFT_FRAC`
+(default `0.7`, chosen so that with `TRAIN_RATIO=0.8` the shift falls inside the
+evaluation portion), and `HOTSHIFT_PERIOD` (default `50_000`).
+
+### Experiment A — YCSB-style workloads
+
+| Scenario | Description | Alpha slot |
+| --- | --- | --- |
+| `ycsb_a`, `ycsb_b`, `ycsb_c` | Keys drawn from a bounded Zipfian over `1..VOCAB_SIZE` with constant `zipf_const` (YCSB default `~0.99`). | Zipfian constant (e.g. `0.99`) |
+| `ycsb_d` | Read-latest, non-stationary: the active population grows by inserting new key ids over time and reads concentrate (Zipfian) on the most-recently-inserted end, so the popular set drifts toward newer keys. | Zipfian constant (e.g. `0.99`) |
+
+YCSB traces are generated synthetically (no external download) with a properly
+bounded inverse-CDF Zipf sampler rather than `numpy.random.zipf` (which is
+unbounded and, when modded, distorts the tail). The default Zipfian constant is
+`YCSB_ZIPF_CONST` (`0.99`).
+
+**Page-access simplification.** The cache simulator consumes only a sequence of
+touched key ids. A YCSB read or update both touch exactly one page, and the
+read/write distinction does not change *which* page is touched, so every YCSB
+operation is collapsed to a single key access and the read/update ratio is
+ignored. Under this page-access model, `ycsb_a` (50/50), `ycsb_b` (95/5), and
+`ycsb_c` (100/0) are statistically equivalent access-key sequences; they are
+still generated as separate scenarios so they can be reported distinctly and so
+future write-aware extensions slot in cleanly.
+
+### Per-scenario alpha slots (`SCENARIO_ALPHAS`)
+
+The experiment loop pairs every scenario with the alpha grid. Because the
+extended scenarios reuse the single `alpha` float slot to mean different things
+(start/shape skew for non-stationary, Zipfian constant for YCSB), the
+`paper_ext` preset defines an optional `CONFIG["SCENARIO_ALPHAS"]` map from
+scenario name to its list of alpha-slot values:
+
+```python
+"SCENARIO_ALPHAS": {
+    "shift":    [1.3],   # start skew 1.3 -> SHIFT_ALPHA_TO (1.8)
+    "hotshift": [1.3],   # Zipf shape 1.3
+    "ycsb_a":   [0.99], "ycsb_b": [0.99], "ycsb_c": [0.99], "ycsb_d": [0.99],
+}
+```
+
+Alpha-grid iteration is routed through a single `alphas_for(scenario)` helper
+(used by both `build_stream_cache` and the main task loop), which returns the
+per-scenario list when present and otherwise falls back to `ZIPF_ALPHAS`. The
+`zipf` scenario is absent from the map, so it always uses `ZIPF_ALPHAS` and its
+behavior is unchanged. Passing `--only_alpha` overrides `alphas_for` for **all**
+scenarios.
+
+### Selecting scenarios
+
+Use `--only_scenario` (comma-separated) to restrict the run to specific
+scenarios; it replaces the preset `SCENARIOS` list, mirroring `--only_alpha` /
+`--only_cache`:
+
+```bash
+--only_scenario shift,hotshift
+--only_scenario ycsb_d
+```
+
+The `quick` preset also defines `SCENARIO_ALPHAS` for the extended scenarios, so
+small CPU smoke runs such as
+`--preset quick --only_scenario ycsb_d --only_cache 16 --seeds 0` resolve to a
+single clean alpha slot without further flags.
+
+### Notes
+
+- **Non-stationary scenarios are not retuned.** `shift` and `hotshift` reuse the
+  Zipf-tuned `best_params.json` (run with `--skip_optuna --best_params_path ...`)
+  precisely to test generalization to distributions the policy did not train on.
+- **YCSB is separately tuned** via the `ycsb` tuning profile (see
+  [Hyperparameter tuning](#hyperparameter-tuning)).
+- **Belady remains a valid offline upper bound** for every scenario: it is
+  computed offline on the full evaluation trace, which is correct for
+  non-stationary and YCSB traces too.
 
 ## Baselines
 
@@ -157,11 +256,18 @@ python run_cache_rl2.py \
 
 Tuning profiles define the representative grid used inside the Optuna objective:
 
-| Profile | Alpha values | Cache sizes | Seeds |
-| --- | --- | --- | --- |
-| `quick` | `1.3, 1.8` | `16, 64` | first configured seed |
-| `paper` | `1.3, 1.5, 1.8` | `16, 64` | first configured seed |
-| `robust` | `1.3, 1.5, 1.8` | `16, 64` | up to two configured seeds |
+| Profile | Scenarios | Alpha slot | Cache sizes | Seeds |
+| --- | --- | --- | --- | --- |
+| `quick` | `zipf` | `1.3, 1.8` | `16, 64` | first configured seed |
+| `paper` | `zipf` | `1.3, 1.5, 1.8` | `16, 64` | first configured seed |
+| `robust` | `zipf` | `1.3, 1.5, 1.8` | `16, 64` | up to two configured seeds |
+| `ycsb` | `ycsb_a`, `ycsb_d` | `0.99` (Zipfian const) | `16, 64` | first configured seed |
+
+The `ycsb` profile retunes on a representative stationary (`ycsb_a`) plus
+non-stationary (`ycsb_d`) YCSB pair and must be run with the YCSB scenarios in
+the grid (e.g. `--preset paper_ext`, optionally narrowed with `--only_scenario`).
+The resulting `best_params.json` can then be loaded for a YCSB-only evaluation
+run with `--skip_optuna --best_params_path ...`.
 
 The objective balances average and difficult-case performance:
 
@@ -286,12 +392,48 @@ python run_cache_rl2.py \
   --seeds 0
 ```
 
+### Extended workloads (non-stationary + YCSB)
+
+The extended experiments use the `paper_ext` preset. Non-stationary scenarios
+reuse the Zipf-tuned parameters, while YCSB is retuned separately.
+
+```bash
+# A) Non-stationary + YCSB-stationary evaluation reusing the Zipf-tuned params (no tuning)
+python run_cache_rl2.py --out_dir out_ext --device cuda --preset paper_ext \
+  --skip_optuna --best_params_path out_paper_opt/best_params.json \
+  --baseline_set paper --only_scenario shift,hotshift,ycsb_a,ycsb_b,ycsb_c \
+  --resume_mode rerun_incomplete
+
+# B) YCSB retuning (separate study), then YCSB evaluation with the tuned params
+python run_cache_rl2.py --out_dir out_ycsb_tune --device cuda --preset paper_ext \
+  --tuning_profile ycsb --optuna_trials 20 --baseline_set paper \
+  --only_scenario ycsb_a,ycsb_b,ycsb_c,ycsb_d --resume_mode rerun_incomplete
+
+# (If you prefer to evaluate all YCSB with the retuned params explicitly:)
+python run_cache_rl2.py --out_dir out_ycsb_eval --device cuda --preset paper_ext \
+  --skip_optuna --best_params_path out_ycsb_tune/best_params.json \
+  --baseline_set paper --only_scenario ycsb_a,ycsb_b,ycsb_c,ycsb_d \
+  --resume_mode rerun_incomplete
+```
+
+These runs are resumable: completed rows in `results.csv` are detected via
+`load_done_ids()` inside the main loop, so an interrupted Colab session resumes
+where it left off when rerun with the same command.
+
 ## Testing
 
 Run the lightweight baseline checks with:
 
 ```bash
 python tests/test_baselines.py
+```
+
+Run the workload generator sanity checks (validity, determinism, distribution
+shift / hot-key rotation / YCSB-D temporal drift, and `build_trace` dispatch)
+with:
+
+```bash
+python tests/test_workloads.py
 ```
 
 Run a syntax check for all Python modules with:
@@ -303,7 +445,7 @@ python -m compileall -q .
 ## Notes for reviewers
 
 - The main reported metric is hit rate percentage. For each run, `results.csv` includes `rl_hit`, `baseline_hit_{name}`, and `rl_minus_baseline_{name}` columns.
-- Belady is computed offline with access to the full evaluation stream; it is included as an upper-bound reference.
-- The workload generator currently supports Zipf traces only. The modular workload interface is in `src/workload/builder.py` if additional scenarios are needed.
+- Belady is computed offline with access to the full evaluation stream; it is included as an upper-bound reference and remains valid for the non-stationary and YCSB scenarios.
+- The workload generator supports stationary Zipf, non-stationary (`shift`, `hotshift`), and YCSB (`ycsb_a`–`ycsb_d`) traces. The modular workload interface is in `src/workload/builder.py` (`zipf.py`, `nonstationary.py`, `ycsb.py`) if additional scenarios are needed.
 - Checkpoints include model weights, optimizer state, replay contents, and training state so that long runs can be resumed.
 - `experiment_config.json` records the Git branch and commit, making it easier to match results to the exact code revision used for an experiment.

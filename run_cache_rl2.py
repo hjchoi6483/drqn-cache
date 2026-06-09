@@ -57,13 +57,14 @@ def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--out_dir", type=str, default="out", help="Directory where experiment outputs are written (default: ./out)")
     p.add_argument("--device", type=str, default="cuda", help="Execution device, e.g., cpu, cuda, or cuda:0 (default: cuda)")
-    p.add_argument("--preset", type=str, choices=["quick", "paper_opt", "full"], default="full")
+    p.add_argument("--preset", type=str, choices=["quick", "paper_opt", "paper_ext", "full"], default="full")
     p.add_argument("--skip_optuna", action="store_true")
     p.add_argument("--best_params_path", type=str, default=None)
-    p.add_argument("--tuning_profile", type=str, choices=["quick", "paper", "robust"], default="paper")
+    p.add_argument("--tuning_profile", type=str, choices=["quick", "paper", "robust", "ycsb"], default="paper")
     p.add_argument("--only_algo", type=str, default=None)
     p.add_argument("--only_alpha", type=str, default=None)
     p.add_argument("--only_cache", type=str, default=None)
+    p.add_argument("--only_scenario", type=str, default=None, help="Comma-separated scenario names to restrict the run grid (e.g., ycsb_d). Replaces the preset SCENARIOS list.")
     p.add_argument("--seeds", type=str, default=None)
     p.add_argument("--baseline_set", type=str, choices=["minimal", "diverse", "paper"], default="paper")
     p.add_argument("--study_name", type=str, default=None)
@@ -157,6 +158,13 @@ CONFIG = {
     "CACHE_SIZES": [16, 64],
     "SCENARIOS": ["zipf"],
 
+    # Non-stationary (Experiment C) and YCSB (Experiment A) knobs. Only used by
+    # the new scenarios; the default "zipf" path ignores them entirely.
+    "SHIFT_ALPHA_TO": 1.8,      # shift end skew (start skew comes from the alpha grid)
+    "SHIFT_FRAC": 0.7,          # fraction of stream before the shift (keeps shift in eval region)
+    "HOTSHIFT_PERIOD": 50_000,  # requests between hot-set rotations
+    "YCSB_ZIPF_CONST": 0.99,    # default YCSB Zipfian constant
+
     # paper-grade baseline set for reporting/comparison
     "BASELINES": ["lru", "lfu", "lruk", "2q", "arc", "tinylfu", "belady"],
 
@@ -227,6 +235,18 @@ def apply_quick_preset(config: Dict[str, Any]):
         "SCENARIOS": ["zipf"],
         "SEEDS": [0, 1],
 
+        # Per-scenario alpha slots so that --only_scenario <new scenario> resolves
+        # to a single clean alpha during quick smoke runs (the default "zipf" path
+        # is unaffected: it is absent here and falls back to ZIPF_ALPHAS).
+        "SCENARIO_ALPHAS": {
+            "shift":    [1.3],
+            "hotshift": [1.3],
+            "ycsb_a":   [0.99],
+            "ycsb_b":   [0.99],
+            "ycsb_c":   [0.99],
+            "ycsb_d":   [0.99],
+        },
+
         # shorter training
         "EPISODE_LEN": 2000,
         "MAX_TRAIN_EPISODES": 80,
@@ -265,11 +285,51 @@ def apply_paper_opt_preset(config: Dict[str, Any]):
     })
 
 
+def apply_paper_ext_preset(config: Dict[str, Any]):
+    # Extended experiments (Experiment C: non-stationary; Experiment A: YCSB).
+    # Mirrors paper_opt's training/eval budget but swaps in the new scenarios and
+    # routes per-scenario alpha slots through SCENARIO_ALPHAS. Non-stationary
+    # scenarios reuse the Zipf-tuned best_params.json; YCSB is retuned separately
+    # via --tuning_profile ycsb.
+    config.update({
+        "EXPERIMENT_TAG": "paper_ext",
+        "NUM_REQUESTS": 500_000,
+        "TRAIN_RATIO": 0.8,
+        "SEEDS": [0, 1, 2, 3, 4],
+        "CACHE_SIZES": [16, 64],
+        # Non-stationary scenarios reuse the alpha slot as the "start"/"shape" skew.
+        # YCSB scenarios reuse the alpha slot as the Zipfian constant.
+        "SCENARIOS": ["shift", "hotshift", "ycsb_a", "ycsb_b", "ycsb_c", "ycsb_d"],
+        "ZIPF_ALPHAS": [1.3],
+        "SCENARIO_ALPHAS": {
+            "shift":    [1.3],     # start skew 1.3 -> SHIFT_ALPHA_TO (1.8)
+            "hotshift": [1.3],     # Zipf shape 1.3
+            "ycsb_a":   [0.99],
+            "ycsb_b":   [0.99],
+            "ycsb_c":   [0.99],
+            "ycsb_d":   [0.99],
+        },
+        "EPISODE_LEN": 2500,
+        "MAX_TRAIN_EPISODES": 160,
+        "REPLAY_MAX_EPISODES": 500,
+        "START_TRAIN_AFTER_EPISODES": 10,
+        "UPDATES_PER_EPISODE": 12,
+        "FAST_EVAL_EVERY_EP": 40,
+        "FAST_EVAL_STEPS": 10_000,
+        "FULL_EVAL_EVERY_EP": 80,
+        "FULL_EVAL_STEPS": 100_000,
+        "SAVE_CKPT": True,
+        "SAVE_CKPT_EVERY_EP": 5,
+    })
+
+
 def apply_preset(config: Dict[str, Any], preset_name: str):
     if preset_name == "quick":
         apply_quick_preset(config)
     elif preset_name == "paper_opt":
         apply_paper_opt_preset(config)
+    elif preset_name == "paper_ext":
+        apply_paper_ext_preset(config)
     elif preset_name == "full":
         config["EXPERIMENT_TAG"] = "full"
     else:
@@ -330,6 +390,11 @@ def apply_cli_filters(config: Dict[str, Any], args: argparse.Namespace):
         config["CACHE_SIZES"] = _parse_csv_numbers(args.only_cache, int, "cache_size")
     if args.seeds is not None:
         config["SEEDS"] = _parse_csv_numbers(args.seeds, int, "seed")
+    if args.only_scenario is not None:
+        scenarios = [tok.strip() for tok in args.only_scenario.split(",") if tok.strip()]
+        if not scenarios:
+            raise ValueError("--only_scenario cannot be empty.")
+        config["SCENARIOS"] = scenarios
 
     global SETTINGS
     if args.only_algo is not None:
@@ -339,6 +404,20 @@ def apply_cli_filters(config: Dict[str, Any], args: argparse.Namespace):
 
 
 apply_cli_filters(CONFIG, ARGS)
+
+
+def alphas_for(scenario: str) -> List[Any]:
+    """Resolve the alpha-slot grid for a scenario.
+
+    Routes per-scenario alpha-slot values through the optional
+    ``CONFIG["SCENARIO_ALPHAS"]`` map, falling back to the shared
+    ``CONFIG["ZIPF_ALPHAS"]`` grid when a scenario is absent. Precedence: if
+    ``--only_alpha`` was provided it overrides the per-scenario map for *all*
+    scenarios (``--only_alpha`` already replaced ``ZIPF_ALPHAS`` upstream).
+    """
+    if ARGS.only_alpha is not None:
+        return CONFIG["ZIPF_ALPHAS"]
+    return CONFIG.get("SCENARIO_ALPHAS", {}).get(scenario, CONFIG["ZIPF_ALPHAS"])
 
 
 # =========================
@@ -819,7 +898,7 @@ def train_one_run(
 def build_stream_cache() -> Dict[Tuple[str, float, int], Dict[str, List[int]]]:
     stream_cache: Dict[Tuple[str, float, int], Dict[str, List[int]]] = {}
     for scenario in CONFIG["SCENARIOS"]:
-        for alpha in CONFIG["ZIPF_ALPHAS"]:
+        for alpha in alphas_for(scenario):
             for seed in CONFIG["SEEDS"]:
                 gk = (scenario, float(alpha), int(seed))
                 req_stream = build_trace(CONFIG, scenario, alpha, seed, set_seed)
@@ -833,8 +912,21 @@ def build_stream_cache() -> Dict[Tuple[str, float, int], Dict[str, List[int]]]:
 
 
 def get_tuning_grid(config: Dict[str, Any], profile: str) -> List[Tuple[str, float, int, int]]:
-    alphas = [1.3, 1.8] if profile == "quick" else [1.3, 1.5, 1.8]
     caches = [16, 64]
+    if profile == "ycsb":
+        # Retune on representative YCSB scenarios: a stationary one (ycsb_a) and a
+        # non-stationary one (ycsb_d). Alpha slot carries the Zipfian constant
+        # (0.99); first configured seed only. The resulting best_params.json can be
+        # loaded for a YCSB-only evaluation run.
+        ycsb_scenarios = ["ycsb_a", "ycsb_d"]
+        seed0 = config["SEEDS"][:1]
+        out = []
+        for scenario in ycsb_scenarios:
+            for c in caches:
+                for seed in seed0:
+                    out.append((scenario, 0.99, int(c), int(seed)))
+        return out
+    alphas = [1.3, 1.8] if profile == "quick" else [1.3, 1.5, 1.8]
     seeds = config["SEEDS"][:1] if profile in {"quick", "paper"} else (config["SEEDS"][:2] if len(config["SEEDS"]) >= 2 else config["SEEDS"][:1])
     out = []
     for a in alphas:
@@ -1155,7 +1247,7 @@ def run_all():
 
     tasks = []
     for scenario in CONFIG["SCENARIOS"]:
-        for alpha in CONFIG["ZIPF_ALPHAS"]:
+        for alpha in alphas_for(scenario):
             for cache_size in CONFIG["CACHE_SIZES"]:
                 for seed in CONFIG["SEEDS"]:
                     for s in SETTINGS:
