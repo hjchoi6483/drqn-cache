@@ -11,6 +11,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 
 from src.workload.builder import build_trace
 from src.workload.nonstationary import trace_zipf_hotshift, trace_zipf_shift
+from src.workload import ycsb as ycsb_module
 from src.workload.ycsb import trace_ycsb
 
 
@@ -51,7 +52,7 @@ def test_validity_and_determinism() -> None:
         ("ycsb_b", lambda: trace_ycsb(NUM_REQUESTS, VOCAB_SIZE, "b", zipf_const=0.99)),
         ("ycsb_c", lambda: trace_ycsb(NUM_REQUESTS, VOCAB_SIZE, "c", zipf_const=0.99)),
         ("ycsb_d", lambda: trace_ycsb(NUM_REQUESTS, VOCAB_SIZE, "d", zipf_const=0.99)),
-        ("ycsb_e", lambda: trace_ycsb(NUM_REQUESTS, VOCAB_SIZE, "e", zipf_const=0.99, max_scan_len=100)),
+        ("ycsb_e", lambda: trace_ycsb(NUM_REQUESTS, VOCAB_SIZE, "e", zipf_const=0.99, max_scan_len=32)),
     ]
     for label, gen in cases:
         set_seed(0)
@@ -107,9 +108,22 @@ def test_ycsb_d_temporal_drift() -> None:
     print("ycsb_d temporal drift: ok")
 
 
+def longest_ascending_run(seq) -> int:
+    """Length of the longest observed +1 run in an emitted trace."""
+    longest = 1
+    current = 1
+    for prev, cur in zip(seq, seq[1:]):
+        if cur == prev + 1:
+            current += 1
+        else:
+            longest = max(longest, current)
+            current = 1
+    return max(longest, current)
+
+
 def test_ycsb_e_scan_structure() -> None:
     set_seed(4)
-    trace = trace_ycsb(NUM_REQUESTS, VOCAB_SIZE, "e", zipf_const=0.99, max_scan_len=100)
+    trace = trace_ycsb(NUM_REQUESTS, VOCAB_SIZE, "e", zipf_const=0.99, max_scan_len=32)
     arr = np.asarray(trace)
     consec = float(np.mean(arr[1:] == arr[:-1] + 1))
 
@@ -117,13 +131,56 @@ def test_ycsb_e_scan_structure() -> None:
     zipfian = np.asarray(trace_ycsb(NUM_REQUESTS, VOCAB_SIZE, "a", zipf_const=0.99))
     zipf_consec = float(np.mean(zipfian[1:] == zipfian[:-1] + 1))
 
-    # With max_scan_len=100 the mean scan length is ~50, so ~98% of adjacent
+    # With max_scan_len=32 the mean scan length is ~16, so most adjacent
     # pairs continue an ascending scan; a Zipfian sequence yields only ~1%.
     assert consec > 0.6, f"ycsb_e: ascending-run fraction too low ({consec:.3f})"
     assert consec > 10 * max(zipf_consec, 1e-9), (
         f"ycsb_e: ascending-run fraction ({consec:.3f}) not clearly above Zipfian baseline ({zipf_consec:.3f})"
     )
     print("ycsb_e scan structure: ok")
+
+
+def test_ycsb_e_configurable_scan_len_20() -> None:
+    max_scan_len = 20
+    starts = [1, 101]
+    state = {"i": 0}
+    original_sample = ycsb_module._sample_bounded_zipf
+    original_randint = ycsb_module.np.random.randint
+
+    def deterministic_start(_cdf, size: int):
+        assert size == 1, "ycsb_e smoke test expects one scan start at a time"
+        value = starts[state["i"] % len(starts)]
+        state["i"] += 1
+        return ycsb_module.np.asarray([value], dtype=ycsb_module.np.int64)
+
+    def deterministic_scan_len(low: int, high: int):
+        assert low == 1 and high == max_scan_len + 1
+        return max_scan_len
+
+    try:
+        # Force non-adjacent scan starts and max-length scans so the emitted +1
+        # runs map exactly to generated scans instead of relying on randomness.
+        ycsb_module._sample_bounded_zipf = deterministic_start
+        ycsb_module.np.random.randint = deterministic_scan_len
+        trace = trace_ycsb(NUM_REQUESTS, VOCAB_SIZE, "e", zipf_const=0.99, max_scan_len=max_scan_len)
+    finally:
+        ycsb_module._sample_bounded_zipf = original_sample
+        ycsb_module.np.random.randint = original_randint
+
+    assert_valid_trace(trace, NUM_REQUESTS, VOCAB_SIZE, "ycsb_e:max_scan_len_20")
+
+    observed_longest_run = longest_ascending_run(trace)
+    assert observed_longest_run == max_scan_len, (
+        f"ycsb_e: observed +1 run {observed_longest_run} does not match configured max_scan_len={max_scan_len}"
+    )
+
+    raised = False
+    try:
+        trace_ycsb(NUM_REQUESTS, VOCAB_SIZE, "e", zipf_const=0.99, max_scan_len=0)
+    except ValueError as exc:
+        raised = "max_scan_len must be >= 1" in str(exc)
+    assert raised, "ycsb_e: invalid max_scan_len did not raise a clear ValueError"
+    print("ycsb_e max_scan_len=20: ok")
 
 
 def test_build_trace_dispatch() -> None:
@@ -134,7 +191,7 @@ def test_build_trace_dispatch() -> None:
         "SHIFT_FRAC": 0.7,
         "HOTSHIFT_PERIOD": 5_000,
         "YCSB_ZIPF_CONST": 0.99,
-        "YCSB_MAX_SCAN_LEN": 100,
+        "YCSB_MAX_SCAN_LEN": 32,
     }
     new_scenarios = {
         "zipf": 1.3,
@@ -170,6 +227,7 @@ def main() -> None:
     test_hotshift_rotates_hot_keys()
     test_ycsb_d_temporal_drift()
     test_ycsb_e_scan_structure()
+    test_ycsb_e_configurable_scan_len_20()
     test_build_trace_dispatch()
     print("workload tests: ok")
 

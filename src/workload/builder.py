@@ -52,7 +52,10 @@ def build_trace(
             vocab,
             workload,
             zipf_const=zipf_const,
-            max_scan_len=int(config.get("YCSB_MAX_SCAN_LEN", 100)),
+            # Only YCSB-E consumes max_scan_len; trace_ycsb ignores it for
+            # YCSB-A/B/C/D. Match the runner's moderated default of 32 when
+            # lightweight callers omit the config key.
+            max_scan_len=int(config.get("YCSB_MAX_SCAN_LEN", 32)),
         )
 
     raise ValueError(scenario)
