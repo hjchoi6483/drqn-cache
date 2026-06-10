@@ -57,13 +57,24 @@ def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--out_dir", type=str, default="out", help="Directory where experiment outputs are written (default: ./out)")
     p.add_argument("--device", type=str, default="cuda", help="Execution device, e.g., cpu, cuda, or cuda:0 (default: cuda)")
-    p.add_argument("--preset", type=str, choices=["quick", "paper_opt", "full"], default="full")
+    p.add_argument("--preset", type=str, choices=["quick", "paper_opt", "paper_ext", "full"], default="full")
     p.add_argument("--skip_optuna", action="store_true")
     p.add_argument("--best_params_path", type=str, default=None)
-    p.add_argument("--tuning_profile", type=str, choices=["quick", "paper", "robust"], default="paper")
+    p.add_argument(
+        "--tuning_profile",
+        type=str,
+        choices=["quick", "paper", "robust", "ycsb_a", "ycsb_d", "ycsb_e"],
+        default="paper",
+        help=(
+            "Optuna tuning grid. The former joint 'ycsb' profile was replaced by per-workload "
+            "profiles (ycsb_a, ycsb_d, ycsb_e): one study per workload, so a collapsing "
+            "non-stationary run cannot be masked inside a joint objective."
+        ),
+    )
     p.add_argument("--only_algo", type=str, default=None)
     p.add_argument("--only_alpha", type=str, default=None)
     p.add_argument("--only_cache", type=str, default=None)
+    p.add_argument("--only_scenario", type=str, default=None, help="Comma-separated scenario names to restrict the run grid (e.g., ycsb_d). Replaces the preset SCENARIOS list.")
     p.add_argument("--seeds", type=str, default=None)
     p.add_argument("--baseline_set", type=str, choices=["minimal", "diverse", "paper"], default="paper")
     p.add_argument("--study_name", type=str, default=None)
@@ -87,6 +98,17 @@ def parse_args():
         help=(
             "Resume policy: rerun_incomplete restarts unfinished runs missing from results.csv (default); "
             "checkpoint resumes training from an existing checkpoint when available."
+        ),
+    )
+    p.add_argument(
+        "--two_stage",
+        type=str,
+        choices=["on", "off"],
+        default="on",
+        help=(
+            "Two-stage TinyLFU admission-gate ablation: off sets USE_TWO_STAGE_TINYLFU=False after "
+            "preset resolution and appends _nostage to EXPERIMENT_TAG so ablation rows do not collide "
+            "with normal rows in results.csv (default: on)."
         ),
     )
     return p.parse_args()
@@ -156,6 +178,14 @@ CONFIG = {
     # cache sizes / scenarios
     "CACHE_SIZES": [16, 64],
     "SCENARIOS": ["zipf"],
+
+    # Non-stationary (Experiment C) and YCSB (Experiment A) knobs. Only used by
+    # the new scenarios; the default "zipf" path ignores them entirely.
+    "SHIFT_ALPHA_TO": 1.8,      # shift end skew (start skew comes from the alpha grid)
+    "SHIFT_FRAC": 0.7,          # fraction of stream before the shift (keeps shift in eval region)
+    "HOTSHIFT_PERIOD": 50_000,  # requests between hot-set rotations
+    "YCSB_ZIPF_CONST": 0.99,    # default YCSB Zipfian constant
+    "YCSB_MAX_SCAN_LEN": 100,   # YCSB-E max range-scan length (YCSB default 100)
 
     # paper-grade baseline set for reporting/comparison
     "BASELINES": ["lru", "lfu", "lruk", "2q", "arc", "tinylfu", "belady"],
@@ -227,6 +257,19 @@ def apply_quick_preset(config: Dict[str, Any]):
         "SCENARIOS": ["zipf"],
         "SEEDS": [0, 1],
 
+        # Per-scenario alpha slots so that --only_scenario <new scenario> resolves
+        # to a single clean alpha during quick smoke runs (the default "zipf" path
+        # is unaffected: it is absent here and falls back to ZIPF_ALPHAS).
+        "SCENARIO_ALPHAS": {
+            "shift":    [1.3],
+            "hotshift": [1.3],
+            "ycsb_a":   [0.99],
+            "ycsb_b":   [0.99],
+            "ycsb_c":   [0.99],
+            "ycsb_d":   [0.99],
+            "ycsb_e":   [0.99],
+        },
+
         # shorter training
         "EPISODE_LEN": 2000,
         "MAX_TRAIN_EPISODES": 80,
@@ -265,11 +308,53 @@ def apply_paper_opt_preset(config: Dict[str, Any]):
     })
 
 
+def apply_paper_ext_preset(config: Dict[str, Any]):
+    # Extended experiments (Experiment C: non-stationary; Experiment A: YCSB).
+    # Mirrors paper_opt's training/eval budget but swaps in the new scenarios and
+    # routes per-scenario alpha slots through SCENARIO_ALPHAS. Non-stationary
+    # scenarios reuse the Zipf-tuned best_params.json; each YCSB workload is
+    # retuned in its own study via --tuning_profile ycsb_a / ycsb_d / ycsb_e.
+    # ycsb_b/ycsb_c are statistically equivalent to ycsb_a under the page-access
+    # model (see src/workload/ycsb.py) and were dropped from the paper grid;
+    # their generators remain available for --only_scenario runs.
+    config.update({
+        "EXPERIMENT_TAG": "paper_ext",
+        "NUM_REQUESTS": 500_000,
+        "TRAIN_RATIO": 0.8,
+        "SEEDS": [0, 1, 2, 3, 4],
+        "CACHE_SIZES": [16, 64],
+        # Non-stationary scenarios reuse the alpha slot as the "start"/"shape" skew.
+        # YCSB scenarios reuse the alpha slot as the Zipfian constant.
+        "SCENARIOS": ["shift", "hotshift", "ycsb_a", "ycsb_d", "ycsb_e"],
+        "ZIPF_ALPHAS": [1.3],
+        "SCENARIO_ALPHAS": {
+            "shift":    [1.3],     # start skew 1.3 -> SHIFT_ALPHA_TO (1.8)
+            "hotshift": [1.3],     # Zipf shape 1.3
+            "ycsb_a":   [0.99],
+            "ycsb_d":   [0.99],
+            "ycsb_e":   [0.99],
+        },
+        "EPISODE_LEN": 2500,
+        "MAX_TRAIN_EPISODES": 160,
+        "REPLAY_MAX_EPISODES": 500,
+        "START_TRAIN_AFTER_EPISODES": 10,
+        "UPDATES_PER_EPISODE": 12,
+        "FAST_EVAL_EVERY_EP": 40,
+        "FAST_EVAL_STEPS": 10_000,
+        "FULL_EVAL_EVERY_EP": 80,
+        "FULL_EVAL_STEPS": 100_000,
+        "SAVE_CKPT": True,
+        "SAVE_CKPT_EVERY_EP": 5,
+    })
+
+
 def apply_preset(config: Dict[str, Any], preset_name: str):
     if preset_name == "quick":
         apply_quick_preset(config)
     elif preset_name == "paper_opt":
         apply_paper_opt_preset(config)
+    elif preset_name == "paper_ext":
+        apply_paper_ext_preset(config)
     elif preset_name == "full":
         config["EXPERIMENT_TAG"] = "full"
     else:
@@ -324,12 +409,26 @@ def apply_cli_filters(config: Dict[str, Any], args: argparse.Namespace):
     apply_preset(config, args.preset)
     apply_baseline_set(config, args.baseline_set)
 
+    if args.two_stage == "off":
+        # Ablation: disable the TinyLFU admission gate (the env honors the flag).
+        # The tag suffix is required because run_id does not encode the two-stage
+        # flag; without it ablation rows would collide with normal rows in
+        # results.csv and be skipped by resume. (get_study_name() already encodes
+        # two-stage separately via its twostage/nostage suffix.)
+        config["USE_TWO_STAGE_TINYLFU"] = False
+        config["EXPERIMENT_TAG"] = f"{config['EXPERIMENT_TAG']}_nostage"
+
     if args.only_alpha is not None:
         config["ZIPF_ALPHAS"] = _parse_csv_numbers(args.only_alpha, float, "alpha")
     if args.only_cache is not None:
         config["CACHE_SIZES"] = _parse_csv_numbers(args.only_cache, int, "cache_size")
     if args.seeds is not None:
         config["SEEDS"] = _parse_csv_numbers(args.seeds, int, "seed")
+    if args.only_scenario is not None:
+        scenarios = [tok.strip() for tok in args.only_scenario.split(",") if tok.strip()]
+        if not scenarios:
+            raise ValueError("--only_scenario cannot be empty.")
+        config["SCENARIOS"] = scenarios
 
     global SETTINGS
     if args.only_algo is not None:
@@ -339,6 +438,20 @@ def apply_cli_filters(config: Dict[str, Any], args: argparse.Namespace):
 
 
 apply_cli_filters(CONFIG, ARGS)
+
+
+def alphas_for(scenario: str) -> List[Any]:
+    """Resolve the alpha-slot grid for a scenario.
+
+    Routes per-scenario alpha-slot values through the optional
+    ``CONFIG["SCENARIO_ALPHAS"]`` map, falling back to the shared
+    ``CONFIG["ZIPF_ALPHAS"]`` grid when a scenario is absent. Precedence: if
+    ``--only_alpha`` was provided it overrides the per-scenario map for *all*
+    scenarios (``--only_alpha`` already replaced ``ZIPF_ALPHAS`` upstream).
+    """
+    if ARGS.only_alpha is not None:
+        return CONFIG["ZIPF_ALPHAS"]
+    return CONFIG.get("SCENARIO_ALPHAS", {}).get(scenario, CONFIG["ZIPF_ALPHAS"])
 
 
 # =========================
@@ -639,6 +752,7 @@ def train_one_run(
     trial: optuna.trial.Trial | None = None,
     persist_result: bool = True,
     run_suffix: str | None = None,
+    trial_step_offset: int = 0,
 ):
     ensure_dirs()
     rid = run_id(scenario, alpha, cache_size, seed, s)
@@ -724,7 +838,10 @@ def train_one_run(
                 res = eval_policy(online, scenario, alpha, test_fast, cache_size, s, eval_kind="fast")
                 eval_rec.update({f"fast_{k}": v for k, v in res.items()})
                 if trial is not None and "fast_rl_hit" in eval_rec:
-                    trial.report(float(eval_rec["fast_rl_hit"]), ep)
+                    # trial_step_offset keeps report steps unique when one trial
+                    # spans several runs (YCSB profiles); zero elsewhere, so the
+                    # report step is just `ep` for the Zipf profiles.
+                    trial.report(float(eval_rec["fast_rl_hit"]), trial_step_offset + ep)
                     if trial.should_prune():
                         raise TrialPruned(f"Pruned at ep={ep}, fast_rl_hit={float(eval_rec['fast_rl_hit']):.4f}")
 
@@ -799,6 +916,10 @@ def train_one_run(
         "final_loss_tail_mean": float(np.mean(st.loss_tail[-1000:])) if st.loss_tail else 0.0,
 
         "rl_hit": float(final["rl_hit"]),
+        # Admission-gate instrumentation from the final full eval; absent keys
+        # default to 0.0 so older eval paths cannot break row construction.
+        "rl_bypass_rate": float(final.get("rl_bypass_rate", 0.0)),
+        "rl_bypass_per_miss": float(final.get("rl_bypass_per_miss", 0.0)),
         "wall_sec": float(time.time() - t0),
     }
 
@@ -819,7 +940,7 @@ def train_one_run(
 def build_stream_cache() -> Dict[Tuple[str, float, int], Dict[str, List[int]]]:
     stream_cache: Dict[Tuple[str, float, int], Dict[str, List[int]]] = {}
     for scenario in CONFIG["SCENARIOS"]:
-        for alpha in CONFIG["ZIPF_ALPHAS"]:
+        for alpha in alphas_for(scenario):
             for seed in CONFIG["SEEDS"]:
                 gk = (scenario, float(alpha), int(seed))
                 req_stream = build_trace(CONFIG, scenario, alpha, seed, set_seed)
@@ -833,8 +954,18 @@ def build_stream_cache() -> Dict[Tuple[str, float, int], Dict[str, List[int]]]:
 
 
 def get_tuning_grid(config: Dict[str, Any], profile: str) -> List[Tuple[str, float, int, int]]:
-    alphas = [1.3, 1.8] if profile == "quick" else [1.3, 1.5, 1.8]
     caches = [16, 64]
+    if profile in {"ycsb_a", "ycsb_d", "ycsb_e"}:
+        # Per-workload YCSB studies (one Optuna study per scenario). The former
+        # joint "ycsb" profile mixed stationary ycsb_a with non-stationary ycsb_d
+        # in one objective (0.8*mean + 0.2*min): one collapsing D run dominated
+        # the min term and no single param set served both. Alpha slot carries
+        # the Zipfian constant (0.99); first configured seed only. The resulting
+        # best_params.json is loaded for that workload's evaluation run.
+        scenario = profile  # profile name == scenario name
+        seed0 = config["SEEDS"][:1]
+        return [(scenario, 0.99, int(c), int(s)) for c in caches for s in seed0]
+    alphas = [1.3, 1.8] if profile == "quick" else [1.3, 1.5, 1.8]
     seeds = config["SEEDS"][:1] if profile in {"quick", "paper"} else (config["SEEDS"][:2] if len(config["SEEDS"]) >= 2 else config["SEEDS"][:1])
     out = []
     for a in alphas:
@@ -845,6 +976,23 @@ def get_tuning_grid(config: Dict[str, Any], profile: str) -> List[Tuple[str, flo
 
 
 def suggest_hparams(trial: optuna.trial.Trial, config: Dict[str, Any]) -> None:
+    if ARGS.tuning_profile.startswith("ycsb"):
+        # Narrowed YCSB search space: removes structurally dead under-training
+        # combos (e.g., 8 updates/ep x ~160 eps = ~1.3k total updates with a
+        # 1000-update target sync -> the target network syncs once per run) and
+        # over-conservative admission settings that delay adaptation on
+        # read-latest workloads. Zipf profiles keep the original space below.
+        config["LR"] = trial.suggest_float("LR", 1e-4, 8e-4, log=True)
+        config["GAMMA"] = trial.suggest_float("GAMMA", 0.95, 0.995)
+        config["UNROLL"] = trial.suggest_categorical("UNROLL", [40, 60, 80])
+        config["BATCH_SIZE"] = trial.suggest_categorical("BATCH_SIZE", [32, 64])
+        config["TARGET_UPDATE_EVERY_UPDATES"] = trial.suggest_categorical("TARGET_UPDATE_EVERY_UPDATES", [200, 500])
+        config["UPDATES_PER_EPISODE"] = trial.suggest_categorical("UPDATES_PER_EPISODE", [12, 16])
+        if config["USE_TWO_STAGE_TINYLFU"]:
+            config["TINYLFU_MIN_ADMIT_COUNT"] = trial.suggest_categorical("TINYLFU_MIN_ADMIT_COUNT", [1, 2])
+            config["RECENT_WINDOW_SIZE"] = trial.suggest_categorical("RECENT_WINDOW_SIZE", [500, 1000])
+            config["RECENT_FREQ_DENOM"] = trial.suggest_categorical("RECENT_FREQ_DENOM", [10.0, 20.0])
+        return
     config["LR"] = trial.suggest_float("LR", 3e-5, 8e-4, log=True)
     config["GAMMA"] = trial.suggest_float("GAMMA", 0.92, 0.995)
     config["UNROLL"] = trial.suggest_categorical("UNROLL", [30, 40, 60, 80])
@@ -872,6 +1020,15 @@ def objective(trial: optuna.trial.Trial, stream_cache: Dict[Tuple[str, float, in
     scores: List[float] = []
     scenario_scores: List[Dict[str, Any]] = []
 
+    # YCSB profiles report each run's episode-level signal at strictly increasing
+    # unique steps: run idx reports episodes at idx*span + ep and its run-boundary
+    # mean at (idx+1)*span. Without the offset, every run after the first reports
+    # at already-seen `ep` steps and Optuna silently ignores them, so the pruner
+    # never sees a mid-run collapse. Non-YCSB profiles (quick/paper/robust) keep
+    # the original step scheme byte-for-byte for Zipf reproducibility.
+    is_ycsb_profile = ARGS.tuning_profile.startswith("ycsb")
+    span = int(CONFIG["MAX_TRAIN_EPISODES"]) + 1
+
     for idx, (scenario, alpha, cache_size, seed) in enumerate(scenario_grid):
         gk = (scenario, float(alpha), int(seed))
         streams = stream_cache[gk]
@@ -887,13 +1044,17 @@ def objective(trial: optuna.trial.Trial, stream_cache: Dict[Tuple[str, float, in
             trial=trial,
             persist_result=False,
             run_suffix=f"optuna_t{trial.number}_s{idx}",
+            trial_step_offset=idx * span if is_ycsb_profile else 0,
         )
         if row is None:
             return 0.0
         score = float(row["rl_hit"])
         scores.append(score)
         scenario_scores.append({"scenario": scenario, "alpha": alpha, "cache_size": cache_size, "seed": seed, "score": score})
-        trial.report(float(np.mean(scores)), idx + 1)
+        if is_ycsb_profile:
+            trial.report(float(np.mean(scores)), (idx + 1) * span)
+        else:
+            trial.report(float(np.mean(scores)), idx + 1)
         if trial.should_prune():
             raise TrialPruned(f"Pruned at scenario #{idx + 1} with mean={np.mean(scores):.4f}")
 
@@ -1155,7 +1316,7 @@ def run_all():
 
     tasks = []
     for scenario in CONFIG["SCENARIOS"]:
-        for alpha in CONFIG["ZIPF_ALPHAS"]:
+        for alpha in alphas_for(scenario):
             for cache_size in CONFIG["CACHE_SIZES"]:
                 for seed in CONFIG["SEEDS"]:
                     for s in SETTINGS:
