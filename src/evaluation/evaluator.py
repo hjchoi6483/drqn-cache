@@ -72,8 +72,12 @@ def evaluate_policy_with_baselines(
     hidden = model.init_hidden(1)
 
     # RL hit rate is based on env.step() hit boolean; bypass is a miss by definition.
+    # Bypasses (admission-gate rejections) are aggregated from the env's
+    # last_step_info so the paper can quantify when the TinyLFU admission stage
+    # over-rejects soon-to-be-hot keys (e.g., read-latest workloads).
     rl_hits = 0
     rl_miss = 0
+    rl_bypass = 0
     for req in test_stream:
         obs = make_obs_fn(env, req)
         a, hidden = select_action_fn(model, obs, hidden, eps=0.0)
@@ -82,9 +86,13 @@ def evaluate_policy_with_baselines(
             rl_hits += 1
         else:
             rl_miss += 1
+        if getattr(env, "last_step_info", {}).get("bypass", False):
+            rl_bypass += 1
 
     total = rl_hits + rl_miss
     rl_hit = (rl_hits / total) * 100.0 if total else 0.0
+    rl_bypass_rate = (rl_bypass / total) if total else 0.0
+    rl_bypass_per_miss = rl_bypass / max(1, rl_miss)
 
     baseline_res = compute_baselines_once(
         scenario=scenario,
@@ -97,7 +105,11 @@ def evaluate_policy_with_baselines(
         build_baselines_fn=build_baselines_fn,
     )
 
-    out = {"rl_hit": float(rl_hit)}
+    out = {
+        "rl_hit": float(rl_hit),
+        "rl_bypass_rate": float(rl_bypass_rate),
+        "rl_bypass_per_miss": float(rl_bypass_per_miss),
+    }
     out.update(baseline_res)
     for name in baseline_names:
         hit = baseline_res.get(f"baseline_hit_{name}", 0.0)

@@ -13,8 +13,10 @@ YCSB operation to a single key access and ignore the read/update ratio. This is
 consistent with treating the buffer cache as page-access driven. Under this
 model, workloads ``a`` (50/50), ``b`` (95/5), and ``c`` (100/0) differ only in
 their read/update mix and are therefore *statistically equivalent* access-key
-sequences; they are still generated as separate scenarios so the paper can
-report them distinctly and so future write-aware extensions slot in cleanly.
+sequences. The ``b``/``c`` generators are kept (documented, tested) for
+completeness and future write-aware extensions, but the paper grid runs only
+``a`` as the stationary representative -- running all three would be wasted
+compute.
 
 Bounded Zipf sampler
 --------------------
@@ -33,6 +35,10 @@ Workloads
 ``d`` (read-latest, non-stationary)
     Recently inserted keys are most likely to be read. See
     :func:`_trace_ycsb_latest` for the exact mechanism.
+``e`` (scan-heavy)
+    Short range scans (consecutive ids) whose start keys are Zipfian. See
+    :func:`_trace_ycsb_scan` for the exact mechanism and the documented
+    simplification versus real YCSB-E.
 
 All generators return ``List[int]`` of length ``num_requests`` with ids in
 ``1..vocab_size`` (id ``0`` -- the env's reserved "empty slot" -- is never
@@ -134,18 +140,63 @@ def _trace_ycsb_latest(num_requests: int, vocab_size: int, zipf_const: float) ->
     return ids.tolist()
 
 
+def _trace_ycsb_scan(
+    num_requests: int,
+    vocab_size: int,
+    zipf_const: float,
+    max_scan_len: int,
+) -> List[int]:
+    """YCSB-E scan-heavy: short range scans whose start keys are Zipfian.
+
+    Mechanism
+    ---------
+    Repeat until ``num_requests`` ids are emitted: draw a scan start key from
+    the bounded Zipf over ``1..vocab_size``, draw a scan length
+    ``L ~ Uniform{1..max_scan_len}`` (YCSB's default max scan length is 100),
+    and emit the consecutive ids ``start, start+1, ..., start+L-1``. A scan is
+    truncated at the vocabulary boundary (no wrap-around), and the final scan is
+    truncated so the trace lands exactly on ``num_requests``.
+
+    Simplification (deliberate)
+    ---------------------------
+    Real YCSB-E is 95% short range-scans plus 5% inserts. Under the page-access
+    model we keep a static vocabulary and model the scan traffic only: the scan
+    runs of one-touch tail keys are precisely the cache-pollution mechanism this
+    workload exists to test, making it the natural stress test for the TinyLFU
+    admission stage and for scan-resistant baselines such as ARC/2Q.
+    """
+    if max_scan_len < 1:
+        raise ValueError(f"max_scan_len must be >= 1, got {max_scan_len}")
+
+    cdf = _bounded_zipf_cdf(vocab_size, zipf_const)
+    ids = np.empty(num_requests, dtype=np.int64)
+    filled = 0
+    while filled < num_requests:
+        start = int(_sample_bounded_zipf(cdf, 1)[0])
+        length = int(np.random.randint(1, max_scan_len + 1))
+        last = min(vocab_size, start + length - 1)  # truncate at vocab boundary
+        run = np.arange(start, last + 1, dtype=np.int64)
+        take = min(run.shape[0], num_requests - filled)  # truncate the last scan
+        ids[filled: filled + take] = run[:take]
+        filled += take
+    return ids.tolist()
+
+
 def trace_ycsb(
     num_requests: int,
     vocab_size: int,
     workload: str,
     zipf_const: float = 0.99,
     seed_for_latest: Optional[int] = None,
+    max_scan_len: int = 100,
 ) -> List[int]:
     """Generate a synthetic YCSB-style access-key sequence.
 
-    ``workload`` is one of ``{"a", "b", "c", "d"}``. ``a``/``b``/``c`` produce a
-    stationary bounded-Zipf sequence (statistically equivalent under the
-    page-access model); ``d`` produces the read-latest non-stationary sequence.
+    ``workload`` is one of ``{"a", "b", "c", "d", "e"}``. ``a``/``b``/``c``
+    produce a stationary bounded-Zipf sequence (statistically equivalent under
+    the page-access model); ``d`` produces the read-latest non-stationary
+    sequence; ``e`` produces the scan-heavy sequence (``max_scan_len`` bounds the
+    uniform scan length and is ignored by the other workloads).
     ``seed_for_latest`` is accepted for interface symmetry; determinism is driven
     by the caller's ``set_seed_fn`` so it is unused here.
     """
@@ -156,4 +207,6 @@ def trace_ycsb(
         return _trace_ycsb_zipfian(num_requests, vocab_size, zipf_const)
     if workload == "d":
         return _trace_ycsb_latest(num_requests, vocab_size, zipf_const)
+    if workload == "e":
+        return _trace_ycsb_scan(num_requests, vocab_size, zipf_const, max_scan_len)
     raise ValueError(f"Unknown YCSB workload: {workload}")

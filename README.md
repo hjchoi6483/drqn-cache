@@ -114,7 +114,7 @@ The default workload grid uses:
 - Train/test split: `80% / 20%`
 
 The `paper_ext` preset instead runs the extended scenarios `shift`, `hotshift`,
-`ycsb_a`, `ycsb_b`, `ycsb_c`, and `ycsb_d` (see
+`ycsb_a`, `ycsb_d`, and `ycsb_e` (see
 [Extended workloads](#extended-workloads-non-stationary-and-ycsb)).
 
 You can restrict a run with:
@@ -151,22 +151,32 @@ evaluation portion), and `HOTSHIFT_PERIOD` (default `50_000`).
 
 | Scenario | Description | Alpha slot |
 | --- | --- | --- |
-| `ycsb_a`, `ycsb_b`, `ycsb_c` | Keys drawn from a bounded Zipfian over `1..VOCAB_SIZE` with constant `zipf_const` (YCSB default `~0.99`). | Zipfian constant (e.g. `0.99`) |
+| `ycsb_a` | Keys drawn from a bounded Zipfian over `1..VOCAB_SIZE` with constant `zipf_const` (YCSB default `~0.99`). The stationary YCSB representative in the paper grid. | Zipfian constant (e.g. `0.99`) |
 | `ycsb_d` | Read-latest, non-stationary: the active population grows by inserting new key ids over time and reads concentrate (Zipfian) on the most-recently-inserted end, so the popular set drifts toward newer keys. | Zipfian constant (e.g. `0.99`) |
+| `ycsb_e` | Scan-heavy: short range scans of consecutive ids (`start, start+1, ...`) whose start keys are Zipfian and whose lengths are `Uniform{1..YCSB_MAX_SCAN_LEN}` (default `100`, the YCSB default max scan length). Scans truncate at the vocabulary boundary rather than wrapping. | Zipfian constant (e.g. `0.99`) |
 
 YCSB traces are generated synthetically (no external download) with a properly
 bounded inverse-CDF Zipf sampler rather than `numpy.random.zipf` (which is
 unbounded and, when modded, distorts the tail). The default Zipfian constant is
-`YCSB_ZIPF_CONST` (`0.99`).
+`YCSB_ZIPF_CONST` (`0.99`); the YCSB-E scan length cap is `YCSB_MAX_SCAN_LEN`
+(`100`).
 
 **Page-access simplification.** The cache simulator consumes only a sequence of
 touched key ids. A YCSB read or update both touch exactly one page, and the
 read/write distinction does not change *which* page is touched, so every YCSB
 operation is collapsed to a single key access and the read/update ratio is
 ignored. Under this page-access model, `ycsb_a` (50/50), `ycsb_b` (95/5), and
-`ycsb_c` (100/0) are statistically equivalent access-key sequences; they are
-still generated as separate scenarios so they can be reported distinctly and so
-future write-aware extensions slot in cleanly.
+`ycsb_c` (100/0) are statistically equivalent access-key sequences, so the
+paper grid runs only `ycsb_a` as the stationary representative — running all
+three would be wasted compute. The `ycsb_b`/`ycsb_c` generators are kept
+(documented, tested) and remain selectable via `--only_scenario`.
+
+**YCSB-E simplification.** Real YCSB-E is 95% short range-scans plus 5%
+inserts. Under the page-access model the vocabulary is kept static and only the
+scan traffic is modeled: the scan runs of one-touch tail keys are precisely the
+cache-pollution mechanism this workload exists to test, making it the natural
+stress test for the TinyLFU admission stage and for scan-resistant baselines
+such as ARC/2Q.
 
 ### Per-scenario alpha slots (`SCENARIO_ALPHAS`)
 
@@ -180,7 +190,7 @@ scenario name to its list of alpha-slot values:
 "SCENARIO_ALPHAS": {
     "shift":    [1.3],   # start skew 1.3 -> SHIFT_ALPHA_TO (1.8)
     "hotshift": [1.3],   # Zipf shape 1.3
-    "ycsb_a":   [0.99], "ycsb_b": [0.99], "ycsb_c": [0.99], "ycsb_d": [0.99],
+    "ycsb_a":   [0.99], "ycsb_d": [0.99], "ycsb_e": [0.99],
 }
 ```
 
@@ -202,17 +212,31 @@ scenarios; it replaces the preset `SCENARIOS` list, mirroring `--only_alpha` /
 --only_scenario ycsb_d
 ```
 
-The `quick` preset also defines `SCENARIO_ALPHAS` for the extended scenarios, so
-small CPU smoke runs such as
-`--preset quick --only_scenario ycsb_d --only_cache 16 --seeds 0` resolve to a
-single clean alpha slot without further flags.
+The `quick` preset also defines `SCENARIO_ALPHAS` for the extended scenarios
+(including `ycsb_e` and the off-grid `ycsb_b`/`ycsb_c`), so small CPU smoke runs
+such as `--preset quick --only_scenario ycsb_e --only_cache 16 --seeds 0`
+resolve to a single clean alpha slot without further flags.
+
+### Two-stage admission ablation (`--two_stage`)
+
+`--two_stage off` (default `on`) disables the TinyLFU admission gate
+(`USE_TWO_STAGE_TINYLFU=False`) after preset resolution and automatically
+appends `_nostage` to `EXPERIMENT_TAG`. The tag suffix is required because
+`run_id` does not otherwise encode the two-stage flag: without it, ablation rows
+would collide with normal rows in `results.csv` and be skipped by resume.
+(Optuna study names already encode two-stage separately via their
+`twostage`/`nostage` suffix.) This supports the paper's ablation of when the
+frequency-based admission filter helps (stationary/scan workloads) versus hurts
+(read-latest workloads, where brand-new keys are immediately the hottest but
+have no accumulated counts).
 
 ### Notes
 
 - **Non-stationary scenarios are not retuned.** `shift` and `hotshift` reuse the
   Zipf-tuned `best_params.json` (run with `--skip_optuna --best_params_path ...`)
   precisely to test generalization to distributions the policy did not train on.
-- **YCSB is separately tuned** via the `ycsb` tuning profile (see
+- **Each YCSB workload is tuned in its own Optuna study** via the per-workload
+  `ycsb_a`/`ycsb_d`/`ycsb_e` tuning profiles (see
   [Hyperparameter tuning](#hyperparameter-tuning)).
 - **Belady remains a valid offline upper bound** for every scenario: it is
   computed offline on the full evaluation trace, which is correct for
@@ -261,13 +285,35 @@ Tuning profiles define the representative grid used inside the Optuna objective:
 | `quick` | `zipf` | `1.3, 1.8` | `16, 64` | first configured seed |
 | `paper` | `zipf` | `1.3, 1.5, 1.8` | `16, 64` | first configured seed |
 | `robust` | `zipf` | `1.3, 1.5, 1.8` | `16, 64` | up to two configured seeds |
-| `ycsb` | `ycsb_a`, `ycsb_d` | `0.99` (Zipfian const) | `16, 64` | first configured seed |
+| `ycsb_a` | `ycsb_a` | `0.99` (Zipfian const) | `16, 64` | first configured seed |
+| `ycsb_d` | `ycsb_d` | `0.99` (Zipfian const) | `16, 64` | first configured seed |
+| `ycsb_e` | `ycsb_e` | `0.99` (Zipfian const) | `16, 64` | first configured seed |
 
-The `ycsb` profile retunes on a representative stationary (`ycsb_a`) plus
-non-stationary (`ycsb_d`) YCSB pair and must be run with the YCSB scenarios in
-the grid (e.g. `--preset paper_ext`, optionally narrowed with `--only_scenario`).
-The resulting `best_params.json` can then be loaded for a YCSB-only evaluation
-run with `--skip_optuna --best_params_path ...`.
+**Per-workload YCSB studies.** Each YCSB workload is tuned in its own Optuna
+study (the study name and storage file embed the profile, so the studies never
+mix). The former joint `ycsb` profile mixed the stationary `ycsb_a` with the
+non-stationary `ycsb_d` in a single `0.8*mean + 0.2*min` objective, where one
+collapsing D run dominated the min term and no single parameter set served both
+workloads. Run each profile with its scenario in the grid (e.g.
+`--preset paper_ext --only_scenario ycsb_d --tuning_profile ycsb_d`); the
+resulting `best_params.json` is then used for that workload's evaluation runs.
+
+**Narrowed YCSB search space.** The `ycsb_*` profiles search a narrowed
+hyperparameter space (`LR 1e-4..8e-4`, `GAMMA 0.95..0.995`, fewer
+categorical choices) because the wide Zipf space contains structurally dead
+combinations for the YCSB budget — e.g. 8 updates/episode over ~160 episodes is
+~1.3k total updates, so a 1000-update target sync fires once per run — and
+over-conservative admission settings that delay adaptation on read-latest
+workloads. The Zipf profiles keep the original space unchanged.
+
+**Unique-step trial reporting.** For `ycsb_*` profiles, each run inside a trial
+reports its episode-level signal at unique, strictly increasing Optuna steps
+(run `idx` reports at `idx*span + ep` with `span = MAX_TRAIN_EPISODES + 1`, and
+its run-boundary mean at `(idx+1)*span`), so the pruner sees every run's
+mid-run signal and can stop a collapsing run early. With the previous scheme,
+one trial called training multiple times and every per-episode report after the
+first run hit an already-reported step and was silently ignored. Non-YCSB
+profiles keep the original reporting byte-for-byte for reproducibility.
 
 The objective balances average and difficult-case performance:
 
@@ -304,7 +350,7 @@ Each run writes the following files under `--out_dir`:
 
 | Path | Description |
 | --- | --- |
-| `results.csv` | One row per completed experiment run, including RL hit rate and baseline hit rates. |
+| `results.csv` | One row per completed experiment run, including RL hit rate, baseline hit rates, and admission-gate instrumentation (`rl_bypass_rate` = bypasses / eval steps, `rl_bypass_per_miss` = bypasses / misses, both from the final full evaluation). Older result files without the bypass columns still load for resume; completion checks key only on `run_id`, `rl_hit`, `train_episodes`, and `total_updates`. |
 | `summary.csv` | Aggregated means and standard deviations grouped by scenario, alpha, cache size, and setting. |
 | `summary_overall.csv` | Overall aggregation by experiment setting and algorithm. |
 | `summary_by_cache.csv` | Aggregation by cache size. |
@@ -395,30 +441,44 @@ python run_cache_rl2.py \
 ### Extended workloads (non-stationary + YCSB)
 
 The extended experiments use the `paper_ext` preset. Non-stationary scenarios
-reuse the Zipf-tuned parameters, while YCSB is retuned separately.
+reuse the Zipf-tuned parameters, while each YCSB workload is tuned in its own
+Optuna study and evaluated with its own parameters.
 
 ```bash
-# A) Non-stationary + YCSB-stationary evaluation reusing the Zipf-tuned params (no tuning)
+# Non-stationary evaluation reusing the Zipf-tuned params (no tuning).
+# (shift/hotshift results from round 1 are kept as-is; do not rerun them.)
 python run_cache_rl2.py --out_dir out_ext --device cuda --preset paper_ext \
   --skip_optuna --best_params_path out_paper_opt/best_params.json \
-  --baseline_set paper --only_scenario shift,hotshift,ycsb_a,ycsb_b,ycsb_c \
+  --baseline_set paper --only_scenario shift,hotshift \
   --resume_mode rerun_incomplete
 
-# B) YCSB retuning (separate study), then YCSB evaluation with the tuned params
-python run_cache_rl2.py --out_dir out_ycsb_tune --device cuda --preset paper_ext \
-  --tuning_profile ycsb --optuna_trials 20 --baseline_set paper \
-  --only_scenario ycsb_a,ycsb_b,ycsb_c,ycsb_d --resume_mode rerun_incomplete
+# Per-workload tuning + final eval (5 seeds), one invocation per workload.
+# Each tunes its own Optuna study, writes best_params.json to its out_dir,
+# then evaluates that workload's full 2-cache x 5-seed grid with the tuned params.
+python run_cache_rl2.py --out_dir out_ycsb_a --device cuda --preset paper_ext \
+  --tuning_profile ycsb_a --optuna_trials 20 --baseline_set paper \
+  --only_scenario ycsb_a --resume_mode rerun_incomplete
 
-# (If you prefer to evaluate all YCSB with the retuned params explicitly:)
-python run_cache_rl2.py --out_dir out_ycsb_eval --device cuda --preset paper_ext \
-  --skip_optuna --best_params_path out_ycsb_tune/best_params.json \
-  --baseline_set paper --only_scenario ycsb_a,ycsb_b,ycsb_c,ycsb_d \
+python run_cache_rl2.py --out_dir out_ycsb_d --device cuda --preset paper_ext \
+  --tuning_profile ycsb_d --optuna_trials 20 --baseline_set paper \
+  --only_scenario ycsb_d --resume_mode rerun_incomplete
+
+python run_cache_rl2.py --out_dir out_ycsb_e --device cuda --preset paper_ext \
+  --tuning_profile ycsb_e --optuna_trials 20 --baseline_set paper \
+  --only_scenario ycsb_e --resume_mode rerun_incomplete
+
+# Ablation: YCSB-D with the admission stage disabled, reusing D-tuned params.
+python run_cache_rl2.py --out_dir out_ycsb_d_nostage --device cuda --preset paper_ext \
+  --skip_optuna --best_params_path out_ycsb_d/best_params.json \
+  --baseline_set paper --only_scenario ycsb_d --two_stage off \
   --resume_mode rerun_incomplete
 ```
 
 These runs are resumable: completed rows in `results.csv` are detected via
 `load_done_ids()` inside the main loop, so an interrupted Colab session resumes
-where it left off when rerun with the same command.
+where it left off when rerun with the same command. The `--two_stage off`
+ablation rows are kept distinct by the automatic `_nostage` experiment-tag
+suffix in their `run_id`s.
 
 ## Testing
 
@@ -446,6 +506,6 @@ python -m compileall -q .
 
 - The main reported metric is hit rate percentage. For each run, `results.csv` includes `rl_hit`, `baseline_hit_{name}`, and `rl_minus_baseline_{name}` columns.
 - Belady is computed offline with access to the full evaluation stream; it is included as an upper-bound reference and remains valid for the non-stationary and YCSB scenarios.
-- The workload generator supports stationary Zipf, non-stationary (`shift`, `hotshift`), and YCSB (`ycsb_a`–`ycsb_d`) traces. The modular workload interface is in `src/workload/builder.py` (`zipf.py`, `nonstationary.py`, `ycsb.py`) if additional scenarios are needed.
+- The workload generator supports stationary Zipf, non-stationary (`shift`, `hotshift`), and YCSB (`ycsb_a`–`ycsb_e`) traces; the paper grid uses `ycsb_a`, `ycsb_d`, and `ycsb_e` (`ycsb_b`/`ycsb_c` are statistically equivalent to `ycsb_a` under the page-access model). The modular workload interface is in `src/workload/builder.py` (`zipf.py`, `nonstationary.py`, `ycsb.py`) if additional scenarios are needed.
 - Checkpoints include model weights, optimizer state, replay contents, and training state so that long runs can be resumed.
 - `experiment_config.json` records the Git branch and commit, making it easier to match results to the exact code revision used for an experiment.

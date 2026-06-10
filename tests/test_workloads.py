@@ -51,6 +51,7 @@ def test_validity_and_determinism() -> None:
         ("ycsb_b", lambda: trace_ycsb(NUM_REQUESTS, VOCAB_SIZE, "b", zipf_const=0.99)),
         ("ycsb_c", lambda: trace_ycsb(NUM_REQUESTS, VOCAB_SIZE, "c", zipf_const=0.99)),
         ("ycsb_d", lambda: trace_ycsb(NUM_REQUESTS, VOCAB_SIZE, "d", zipf_const=0.99)),
+        ("ycsb_e", lambda: trace_ycsb(NUM_REQUESTS, VOCAB_SIZE, "e", zipf_const=0.99, max_scan_len=100)),
     ]
     for label, gen in cases:
         set_seed(0)
@@ -106,6 +107,25 @@ def test_ycsb_d_temporal_drift() -> None:
     print("ycsb_d temporal drift: ok")
 
 
+def test_ycsb_e_scan_structure() -> None:
+    set_seed(4)
+    trace = trace_ycsb(NUM_REQUESTS, VOCAB_SIZE, "e", zipf_const=0.99, max_scan_len=100)
+    arr = np.asarray(trace)
+    consec = float(np.mean(arr[1:] == arr[:-1] + 1))
+
+    set_seed(4)
+    zipfian = np.asarray(trace_ycsb(NUM_REQUESTS, VOCAB_SIZE, "a", zipf_const=0.99))
+    zipf_consec = float(np.mean(zipfian[1:] == zipfian[:-1] + 1))
+
+    # With max_scan_len=100 the mean scan length is ~50, so ~98% of adjacent
+    # pairs continue an ascending scan; a Zipfian sequence yields only ~1%.
+    assert consec > 0.6, f"ycsb_e: ascending-run fraction too low ({consec:.3f})"
+    assert consec > 10 * max(zipf_consec, 1e-9), (
+        f"ycsb_e: ascending-run fraction ({consec:.3f}) not clearly above Zipfian baseline ({zipf_consec:.3f})"
+    )
+    print("ycsb_e scan structure: ok")
+
+
 def test_build_trace_dispatch() -> None:
     config = {
         "NUM_REQUESTS": NUM_REQUESTS,
@@ -114,6 +134,7 @@ def test_build_trace_dispatch() -> None:
         "SHIFT_FRAC": 0.7,
         "HOTSHIFT_PERIOD": 5_000,
         "YCSB_ZIPF_CONST": 0.99,
+        "YCSB_MAX_SCAN_LEN": 100,
     }
     new_scenarios = {
         "zipf": 1.3,
@@ -123,6 +144,7 @@ def test_build_trace_dispatch() -> None:
         "ycsb_b": 0.99,
         "ycsb_c": 0.99,
         "ycsb_d": 0.99,
+        "ycsb_e": 0.99,
     }
     for scenario, alpha in new_scenarios.items():
         trace = build_trace(config, scenario, alpha, seed=0, set_seed_fn=set_seed)
@@ -147,6 +169,7 @@ def main() -> None:
     test_shift_changes_distribution()
     test_hotshift_rotates_hot_keys()
     test_ycsb_d_temporal_drift()
+    test_ycsb_e_scan_structure()
     test_build_trace_dispatch()
     print("workload tests: ok")
 

@@ -40,13 +40,19 @@ def build_trace(
         period = int(config["HOTSHIFT_PERIOD"])
         return trace_zipf_hotshift(nreq, vocab, float(alpha), period)
 
-    if scenario in ("ycsb_a", "ycsb_b", "ycsb_c", "ycsb_d"):
+    if scenario in ("ycsb_a", "ycsb_b", "ycsb_c", "ycsb_d", "ycsb_e"):
         workload = scenario.split("_")[1]
         lo, hi = YCSB_ALPHA_AS_CONST_RANGE
         if lo < float(alpha) <= hi:
             zipf_const = float(alpha)
         else:
             zipf_const = float(config.get("YCSB_ZIPF_CONST", 0.99))
-        return trace_ycsb(nreq, vocab, workload, zipf_const=zipf_const)
+        return trace_ycsb(
+            nreq,
+            vocab,
+            workload,
+            zipf_const=zipf_const,
+            max_scan_len=int(config.get("YCSB_MAX_SCAN_LEN", 100)),
+        )
 
     raise ValueError(scenario)
