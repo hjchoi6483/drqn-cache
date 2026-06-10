@@ -76,6 +76,17 @@ def parse_args():
     p.add_argument("--only_cache", type=str, default=None)
     p.add_argument("--only_scenario", type=str, default=None, help="Comma-separated scenario names to restrict the run grid (e.g., ycsb_d). Replaces the preset SCENARIOS list.")
     p.add_argument("--seeds", type=str, default=None)
+    p.add_argument(
+        "--ycsb_max_scan_len",
+        type=int,
+        default=None,
+        help=(
+            "Override CONFIG[\"YCSB_MAX_SCAN_LEN\"] for YCSB-E trace generation. "
+            "YCSB's original default max scan length is 100; for cache sizes 16 and 64 "
+            "that is too aggressive for this simulator, so the default is moderated to 32. "
+            "Use 20 or 32 for YCSB-E smoke tests."
+        ),
+    )
     p.add_argument("--baseline_set", type=str, choices=["minimal", "diverse", "paper"], default="paper")
     p.add_argument("--study_name", type=str, default=None)
     p.add_argument("--optuna_storage", type=str, default=None)
@@ -185,7 +196,11 @@ CONFIG = {
     "SHIFT_FRAC": 0.7,          # fraction of stream before the shift (keeps shift in eval region)
     "HOTSHIFT_PERIOD": 50_000,  # requests between hot-set rotations
     "YCSB_ZIPF_CONST": 0.99,    # default YCSB Zipfian constant
-    "YCSB_MAX_SCAN_LEN": 100,   # YCSB-E max range-scan length (YCSB default 100)
+    # YCSB-E max range-scan length. The original YCSB default is 100,
+    # but that is too aggressive for this simulator at cache sizes 16 and 64;
+    # 32 keeps the workload scan-heavy while moderating cache pollution. For
+    # smoke tests, pass --ycsb_max_scan_len 20 or --ycsb_max_scan_len 32.
+    "YCSB_MAX_SCAN_LEN": 32,
 
     # paper-grade baseline set for reporting/comparison
     "BASELINES": ["lru", "lfu", "lruk", "2q", "arc", "tinylfu", "belady"],
@@ -429,6 +444,14 @@ def apply_cli_filters(config: Dict[str, Any], args: argparse.Namespace):
         if not scenarios:
             raise ValueError("--only_scenario cannot be empty.")
         config["SCENARIOS"] = scenarios
+
+    if args.ycsb_max_scan_len is not None:
+        if args.ycsb_max_scan_len < 1:
+            raise ValueError(f"--ycsb_max_scan_len must be >= 1, got {args.ycsb_max_scan_len}")
+        # Fixed workload setting applied after presets and CLI filters. The
+        # builder passes it only to YCSB trace generation, and trace_ycsb ignores
+        # max_scan_len for YCSB-A/B/C/D, so Zipf, shift, and hotshift are unchanged.
+        config["YCSB_MAX_SCAN_LEN"] = args.ycsb_max_scan_len
 
     global SETTINGS
     if args.only_algo is not None:

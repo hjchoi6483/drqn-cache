@@ -37,8 +37,9 @@ Workloads
     :func:`_trace_ycsb_latest` for the exact mechanism.
 ``e`` (scan-heavy)
     Short range scans (consecutive ids) whose start keys are Zipfian. See
-    :func:`_trace_ycsb_scan` for the exact mechanism and the documented
-    simplification versus real YCSB-E.
+    :func:`_trace_ycsb_scan` for the exact mechanism, the moderated default
+    scan length used by the runner, and the documented simplification versus
+    real YCSB-E.
 
 All generators return ``List[int]`` of length ``num_requests`` with ids in
 ``1..vocab_size`` (id ``0`` -- the env's reserved "empty slot" -- is never
@@ -152,10 +153,14 @@ def _trace_ycsb_scan(
     ---------
     Repeat until ``num_requests`` ids are emitted: draw a scan start key from
     the bounded Zipf over ``1..vocab_size``, draw a scan length
-    ``L ~ Uniform{1..max_scan_len}`` (YCSB's default max scan length is 100),
-    and emit the consecutive ids ``start, start+1, ..., start+L-1``. A scan is
+    ``L ~ Uniform{1..max_scan_len}`` (YCSB's original default max scan length
+    is 100), and emit the consecutive ids ``start, start+1, ..., start+L-1``. A scan is
     truncated at the vocabulary boundary (no wrap-around), and the final scan is
-    truncated so the trace lands exactly on ``num_requests``.
+    truncated so the trace lands exactly on ``num_requests``. The experiment
+    runner defaults this bound to 32 because max scan length 100 is too
+    aggressive for this simulator at cache sizes 16 and 64; 32 is a moderated
+    scan-heavy setting, and ``--ycsb_max_scan_len 20`` or
+    ``--ycsb_max_scan_len 32`` are useful smoke-test settings.
 
     Simplification (deliberate)
     ---------------------------
@@ -188,7 +193,7 @@ def trace_ycsb(
     workload: str,
     zipf_const: float = 0.99,
     seed_for_latest: Optional[int] = None,
-    max_scan_len: int = 100,
+    max_scan_len: int = 32,
 ) -> List[int]:
     """Generate a synthetic YCSB-style access-key sequence.
 
@@ -196,7 +201,9 @@ def trace_ycsb(
     produce a stationary bounded-Zipf sequence (statistically equivalent under
     the page-access model); ``d`` produces the read-latest non-stationary
     sequence; ``e`` produces the scan-heavy sequence (``max_scan_len`` bounds the
-    uniform scan length and is ignored by the other workloads).
+    uniform scan length and is ignored by the other workloads). The original
+    YCSB-E bound is 100, but the runner defaults to 32 for cache-size-16/64
+    experiments to keep scans heavy without making them overly extreme.
     ``seed_for_latest`` is accepted for interface symmetry; determinism is driven
     by the caller's ``set_seed_fn`` so it is unused here.
     """
